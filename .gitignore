@@ -1,0 +1,31 @@
+# Rust build artifacts
+target/
+**/*.rs.bk
+*.pdb
+
+# Python & Virtual Environments
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+wheels/
+*.whl
+
+# Testing & Linters cache
+.pytest_cache/
+.ruff_cache/
+_probe/
+
+# Internal task / status reports (per user request)
+STATUS.md
+STATUS_*.md
+*.log
+
+# System files
+.DS_Store
+Thumbs.db

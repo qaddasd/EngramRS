@@ -1,0 +1,33 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "engram-rs"
+version = "0.3.0"
+description = "Zero-copy activation capture and adapter compilation"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "torch>=2.0",
+    "peft>=0.17,<0.18",
+    "safetensors>=0.4,<0.9",
+    "transformers>=4.49,<5",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=7.0"]
+
+[project.scripts]
+engram = "engram_rs.cli:main"
+
+[tool.maturin]
+python-source = "python"
+module-name = "engram_rs.engram_rs"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+    "e2e: pretrained-model context erasure benchmark (set ENGRAM_RUN_E2E=1)",
+]

@@ -1,0 +1,229 @@
+{
+  "device": "cuda",
+  "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "part1_multi_needle": [
+    {
+      "domain": "Cryptography",
+      "depth": "15%",
+      "expected": "CIPHER-7749-DELTA",
+      "full": {
+        "tokens": 2009,
+        "ttft_ms": 5509.942600001523,
+        "ppl": 1.4611270427703857,
+        "gen": "The master encryption override code for Sector 7 is CIPHER-7749-DELTA. This code is",
+        "success": true
+      },
+      "bare": {
+        "tokens": 16,
+        "ttft_ms": 63.9195000003383,
+        "ppl": 85.85482025146484,
+        "gen": "The master encryption override code for Sector 7 is 0x12345678.\nIs the",
+        "success": false
+      },
+      "engram": {
+        "tokens": 16,
+        "ttft_ms": 59.73509999967064,
+        "ppl": 85.66531372070312,
+        "ppl_drop": 0.22072905191189354,
+        "gen": "The master encryption override code for Sector 7 is 0x12345678.\nIs the",
+        "success": false
+      },
+      "prefix": {
+        "tokens": 48,
+        "ttft_ms": 58.56090000088443,
+        "gen": ":[[:[[:[[:[[:[[:[[:[[спект:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[ORS",
+        "success": false
+      }
+    },
+    {
+      "domain": "Distributed Databases",
+      "depth": "35%",
+      "expected": "172.28.94.215",
+      "full": {
+        "tokens": 2011,
+        "ttft_ms": 5429.232800001046,
+        "ppl": 1.4752124547958374,
+        "gen": "The primary coordinator node in cluster Atlas is located at IP address 172.28.94.2",
+        "success": false
+      },
+      "bare": {
+        "tokens": 18,
+        "ttft_ms": 88.82699999958277,
+        "ppl": 6.928889274597168,
+        "gen": "The primary coordinator node is the node that manages all the other nodes in the cluster. It is responsible for coordinating the communication",
+        "success": false
+      },
+      "engram": {
+        "tokens": 18,
+        "ttft_ms": 96.49619999981951,
+        "ppl": 6.927026748657227,
+        "ppl_drop": 0.026880584551550506,
+        "gen": "The primary coordinator node is the node that manages all the other nodes in the cluster. It is responsible for coordinating the communication",
+        "success": false
+      },
+      "prefix": {
+        "tokens": 50,
+        "ttft_ms": 95.84819999872707,
+        "gen": ":[[:[[ORSспектListComponent:[[:[[:[[:[[:[[:[[stakeserrupted:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[",
+        "success": false
+      }
+    },
+    {
+      "domain": "Quantum Hardware",
+      "depth": "55%",
+      "expected": "142.6 microseconds",
+      "full": {
+        "tokens": 2011,
+        "ttft_ms": 5469.887400002335,
+        "ppl": 1.851483941078186,
+        "gen": "The operational qubit coherence dephasing time T2 is exactly 142.6 microseconds. This value represents",
+        "success": true
+      },
+      "bare": {
+        "tokens": 18,
+        "ttft_ms": 95.28769999815268,
+        "ppl": 35.256065368652344,
+        "gen": "The operational qubit coherence dephasing time T2 is a measure of how long it takes for the qubit to",
+        "success": false
+      },
+      "engram": {
+        "tokens": 18,
+        "ttft_ms": 92.61789999800385,
+        "ppl": 35.65336990356445,
+        "ppl_drop": -1.126911159137371,
+        "gen": "The operational qubit coherence dephasing time T2 is a measure of how long it takes for the qubit to",
+        "success": false
+      },
+      "prefix": {
+        "tokens": 50,
+        "ttft_ms": 98.02919999856385,
+        "gen": "спект:[[:[[errupted\"),\"ORS,”спект onResponsestakesksz，“:[[:[[:[[\">×</:[[ rowspanrobe:[[:[[:[[:[[:[[",
+        "success": false
+      }
+    },
+    {
+      "domain": "Aerospace Engineering",
+      "depth": "75%",
+      "expected": "3850 seconds",
+      "full": {
+        "tokens": 2015,
+        "ttft_ms": 5398.980800000572,
+        "ppl": 1.7095756530761719,
+        "gen": "The specific impulse achieved by the ion thruster in vacuum test vacuum-4 is 3850 seconds. This",
+        "success": true
+      },
+      "bare": {
+        "tokens": 22,
+        "ttft_ms": 90.49980000054347,
+        "ppl": 13.48483943939209,
+        "gen": "The specific impulse of the ion thruster in vacuum test vacuum-4 was 1.2 seconds.\n This question and",
+        "success": false
+      },
+      "engram": {
+        "tokens": 22,
+        "ttft_ms": 93.7779000014416,
+        "ppl": 13.474404335021973,
+        "ppl_drop": 0.07738397195619567,
+        "gen": "The specific impulse of the ion thruster used for the vacuum test was 1.2 seconds.\n A single-select problem",
+        "success": false
+      },
+      "prefix": {
+        "tokens": 54,
+        "ttft_ms": 96.37450000082026,
+        "gen": ":[[спектListComponent:[[:[[\"),\":[[:[[:[[ORS:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[",
+        "success": false
+      }
+    },
+    {
+      "domain": "Biochemical Synthesis",
+      "depth": "95%",
+      "expected": "6.85",
+      "full": {
+        "tokens": 2013,
+        "ttft_ms": 5403.789100000722,
+        "ppl": 2.7673404216766357,
+        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 is 6.85. This value was determined",
+        "success": true
+      },
+      "bare": {
+        "tokens": 20,
+        "ttft_ms": 96.12539999943692,
+        "ppl": 11.443442344665527,
+        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 was determined to be 7.5.\n A single",
+        "success": false
+      },
+      "engram": {
+        "tokens": 20,
+        "ttft_ms": 91.78430000247317,
+        "ppl": 11.132637977600098,
+        "ppl_drop": 2.716004133234561,
+        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 was determined to be 7.5.\n A single",
+        "success": false
+      },
+      "prefix": {
+        "tokens": 52,
+        "ttft_ms": 98.4308000006422,
+        "gen": ":[[ORSItemList:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[",
+        "success": false
+      }
+    }
+  ],
+  "part2_scaling": [
+    {
+      "target_len": 512,
+      "actual_tokens": 591,
+      "kv_cache_mib": 6.92578125,
+      "rust_compile_ms": 1486.6015,
+      "full_ttft_ms": 1555.2215999996406,
+      "engram_ttft_ms": 66.01059999957215,
+      "speedup": 23.5601797288575,
+      "compression_pct": 97.29272419627749
+    },
+    {
+      "target_len": 1024,
+      "actual_tokens": 1156,
+      "kv_cache_mib": 13.546875,
+      "rust_compile_ms": 3899.504,
+      "full_ttft_ms": 3173.9842999995744,
+      "engram_ttft_ms": 230.92750000068918,
+      "speedup": 13.74450552658346,
+      "compression_pct": 98.6159169550173
+    },
+    {
+      "target_len": 2048,
+      "actual_tokens": 2128,
+      "kv_cache_mib": 24.9375,
+      "rust_compile_ms": 7675.5078,
+      "full_ttft_ms": 5934.556799998973,
+      "engram_ttft_ms": 233.8322999967204,
+      "speedup": 25.37954251864352,
+      "compression_pct": 99.24812030075188
+    }
+  ],
+  "part3_ablation": [
+    {
+      "label": "Attention only (`o_proj`)",
+      "targets": "o_proj",
+      "compile_ms": 407.2491,
+      "size_kb": 898.03125,
+      "ppl": 86.38035583496094,
+      "ppl_drop": 0.21472871154841047
+    },
+    {
+      "label": "MLP SwiGLU only (`down_proj`)",
+      "targets": "down_proj",
+      "compile_ms": 6701.4533,
+      "size_kb": 2882.015625,
+      "ppl": 83.94172668457031,
+      "ppl_drop": 3.031795960131883
+    },
+    {
+      "label": "Dual (`o_proj` + `down_proj`)",
+      "targets": "o_proj+down_proj",
+      "compile_ms": 7138.7225,
+      "size_kb": 3780.0703125,
+      "ppl": 86.76207733154297,
+      "ppl_drop": -0.22623014680414333
+    }
+  ]
+}

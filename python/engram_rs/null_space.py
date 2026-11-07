@@ -317,14 +317,15 @@ def get_family_background_anchors(
     num_anchors: int = 64,
     seed: int = 42,
 ) -> np.ndarray:
-    """Generate standardized prior anchors for popular transformer families.
+    """Generate synthetic harmonic Fourier basis prior anchors for testing.
 
-    Provides pre-calibrated harmonic and Fourier basis anchors modeling the
-    typical spectral representation of background tokens in LLaMA, Mistral,
-    and Qwen transformer families.
+    Note: This function generates synthetic harmonic wave anchors with low-frequency
+    decay for unit testing and algebraic null-space verification.
+    For genuine production background preservation, use `calibrate_background_anchors()`
+    which extracts authentic activation statistics directly from a model forward pass.
 
     Args:
-        family_name: Model family ("llama", "llama3", "mistral", "qwen", or "generic").
+        family_name: Model family tag for frequency tuning.
         d_model: Hidden dimension (d_model).
         num_anchors: Number of anchor vectors (rows).
         seed: Random seed for deterministic reproducibility.

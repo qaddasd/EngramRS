@@ -20,6 +20,7 @@ pub struct AdapterConfig<'a> {
     pub peft_type: &'static str,
     pub r: usize,
     pub rank_pattern: HashMap<String, usize>,
+    pub alpha_pattern: HashMap<String, usize>,
     pub target_modules: Vec<String>,
     pub task_type: Option<&'static str>,
 }
@@ -62,11 +63,13 @@ pub fn write_peft_config(
     let max_rank = layers.iter().map(|l| l.rank).max().unwrap_or(1);
     let ranks_differ = layers.iter().any(|l| l.rank != max_rank);
     let mut rank_pattern = HashMap::new();
+    let mut alpha_pattern = HashMap::new();
     if ranks_differ {
         for layer in layers {
             let sub_path = module_sub_path(&layer.target);
             let pattern_key = format!("layers.{}.{}", layer.layer_index, sub_path);
-            rank_pattern.insert(pattern_key, layer.rank);
+            rank_pattern.insert(pattern_key.clone(), layer.rank);
+            alpha_pattern.insert(pattern_key, layer.rank);
         }
     }
 
@@ -92,6 +95,7 @@ pub fn write_peft_config(
         peft_type: "LORA",
         r: max_rank,
         rank_pattern,
+        alpha_pattern,
         target_modules,
         task_type: Some("CAUSAL_LM"),
     };

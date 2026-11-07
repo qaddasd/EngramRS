@@ -223,25 +223,33 @@ class EngramCompiler:
                 layer_indices=list(catcher.layer_indices),
             )
 
-            if strict_null_projection and null_states_list is not None:
+            if strict_null_projection:
                 from .null_space import project_lora_to_null_space
                 from safetensors.torch import load_file, save_file
 
                 sf_path = destination / "adapter_model.safetensors"
                 tensors = load_file(str(sf_path))
+                o_sinks = catcher.get_sink_tokens("o_proj")
+                mlp_sinks = catcher.get_sink_tokens("down_proj")
                 for pos, layer_idx in enumerate(catcher.layer_indices):
-                    if pos >= len(null_states_list):
-                        break
-                    null_mat = null_states_list[pos]
-                    for target_mod in ("self_attn.o_proj", "mlp.down_proj"):
+                    for target_mod, sink_map in (("self_attn.o_proj", o_sinks), ("mlp.down_proj", mlp_sinks)):
                         a_key = f"base_model.model.model.layers.{layer_idx}.{target_mod}.lora_A.weight"
                         b_key = f"base_model.model.model.layers.{layer_idx}.{target_mod}.lora_B.weight"
                         if a_key in tensors and b_key in tensors:
-                            if tensors[a_key].shape[1] == null_mat.shape[1]:
-                                a_proj, _ = project_lora_to_null_space(
-                                    tensors[a_key], tensors[b_key], null_mat
-                                )
-                                tensors[a_key] = a_proj
+                            target_null: np.ndarray | None = None
+                            if layer_idx in sink_map:
+                                target_null = sink_map[layer_idx]
+                            elif null_states_list is not None and pos < len(null_states_list):
+                                if tensors[a_key].shape[1] == null_states_list[pos].shape[1]:
+                                    target_null = null_states_list[pos]
+                            if target_null is not None:
+                                if target_null.ndim == 1:
+                                    target_null = target_null.reshape(1, -1)
+                                if tensors[a_key].shape[1] == target_null.shape[1]:
+                                    a_proj, _ = project_lora_to_null_space(
+                                        tensors[a_key], tensors[b_key], target_null
+                                    )
+                                    tensors[a_key] = a_proj
                 save_file(tensors, str(sf_path))
         finally:
             catcher.clear()
@@ -268,13 +276,24 @@ class EngramCompiler:
         lambda_reg: float = 1e-4,
         overlap_tokens: int = 128,
         null_states: Any = None,
+        strict_null_projection: bool = False,
+        layer_indices: Iterable[int] | None = None,
         use_rsvd: bool = False,
+        **kwargs: Any,
     ) -> str:
         import time
         from .streaming import StreamingCovarianceAccumulator
 
         start_time = time.perf_counter()
-        accumulator = StreamingCovarianceAccumulator(self.model)
+        d_model = getattr(
+            self.model,
+            "d_model",
+            getattr(getattr(self.model, "config", None), "hidden_size", None),
+        )
+        selected_layers = resolve_layer_indices(self.model, layer_indices)
+        accumulator = StreamingCovarianceAccumulator(
+            d_model=d_model, layer_indices=selected_layers
+        )
         total_tokens = accumulator.accumulate_from_model(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -296,6 +315,7 @@ class EngramCompiler:
             base_model_name_or_path=base_name,
             method="randomized_svd" if use_rsvd else "svd",
             null_states=null_states,
+            strict_null_projection=strict_null_projection,
         )
         self.last_compile_time_ms = (time.perf_counter() - start_time) * 1000.0
         return str(out_path)
@@ -309,5 +329,14 @@ class EngramCompiler:
             raise FileNotFoundError(adapter_path / "adapter_model.safetensors")
         if not (adapter_path / "adapter_config.json").is_file():
             raise FileNotFoundError(adapter_path / "adapter_config.json")
-        base = model.get_base_model() if hasattr(model, "get_base_model") else model
+
+        if hasattr(model, "unload"):
+            try:
+                base = model.unload()
+            except Exception:
+                base = model.get_base_model() if hasattr(model, "get_base_model") else model
+        elif hasattr(model, "get_base_model"):
+            base = model.get_base_model()
+        else:
+            base = model
         return PeftModel.from_pretrained(base, str(adapter_path))

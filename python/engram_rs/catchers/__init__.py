@@ -193,14 +193,15 @@ class EngramContextCatcher:
                 layer = self._layers[index]
                 if "o_proj" in self.targets:
                     catcher = self._attention_catchers[index]
-                    self._handles.append(
-                        catcher.input_layernorm.register_forward_hook(
-                            self._make_o_proj_input_hook(index, catcher)
+                    if catcher.input_layernorm is not None:
+                        self._handles.append(
+                            catcher.input_layernorm.register_forward_hook(
+                                self._make_input_layernorm_hook(index, catcher)
+                            )
                         )
-                    )
                     self._handles.append(
                         catcher.o_proj.register_forward_hook(
-                            self._make_o_proj_output_hook(index, catcher)
+                            self._make_o_proj_hook(index, catcher)
                         )
                     )
                 if "down_proj" in self.targets:
@@ -226,29 +227,49 @@ class EngramContextCatcher:
         self.remove_hooks()
         return False
 
-    def _make_o_proj_input_hook(self, layer_index: int, catcher: AttentionCatcher) -> Any:
+    def _make_input_layernorm_hook(self, layer_index: int, catcher: AttentionCatcher) -> Any:
         def hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
             del module, inputs
             if layer_index in self._inputs["o_proj"]:
                 raise RuntimeError(
-                    f"decoder layer {layer_index} produced self_attn.o_proj input more than once; "
+                    f"decoder layer {layer_index} produced input_layernorm activations more than once; "
                     "EngramContextCatcher captures exactly one pass"
                 )
-            arr = capture_tensor(output, layer_index, "o_proj_input")
-            self._inputs["o_proj"][layer_index] = arr
+            in_res = capture_tensor(output, layer_index, "input_layernorm", return_sink=True)
+            if isinstance(in_res, tuple):
+                in_arr, in_sink = in_res
+                catcher.sink_input = in_sink
+            else:
+                in_arr = in_res
+            self._inputs["o_proj"][layer_index] = in_arr
 
         return hook
 
-    def _make_o_proj_output_hook(self, layer_index: int, catcher: AttentionCatcher) -> Any:
+    def _make_o_proj_hook(self, layer_index: int, catcher: AttentionCatcher) -> Any:
         def hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
-            del module, inputs
+            del module
             if layer_index in self._outputs["o_proj"]:
                 raise RuntimeError(
-                    f"decoder layer {layer_index} produced self_attn.o_proj output more than once; "
+                    f"decoder layer {layer_index} produced self_attn.o_proj activations more than once; "
                     "EngramContextCatcher captures exactly one pass"
                 )
-            arr = capture_tensor(output, layer_index, "o_proj_output")
-            self._outputs["o_proj"][layer_index] = arr
+            if layer_index not in self._inputs["o_proj"] and inputs:
+                in_res = capture_tensor(inputs[0], layer_index, "o_proj_input", return_sink=True)
+                if isinstance(in_res, tuple):
+                    in_arr, in_sink = in_res
+                    if catcher.sink_input is None:
+                        catcher.sink_input = in_sink
+                else:
+                    in_arr = in_res
+                self._inputs["o_proj"][layer_index] = in_arr
+
+            out_res = capture_tensor(output, layer_index, "o_proj_output", return_sink=True)
+            if isinstance(out_res, tuple):
+                out_arr, out_sink = out_res
+                catcher.sink_output = out_sink
+            else:
+                out_arr = out_res
+            self._outputs["o_proj"][layer_index] = out_arr
 
         return hook
 
@@ -264,9 +285,20 @@ class EngramContextCatcher:
                 raise RuntimeError(
                     f"decoder layer {layer_index} mlp.down_proj received an empty inputs tuple"
                 )
-            in_arr = capture_tensor(inputs[0], layer_index, "down_proj_input")
-            out_arr = capture_tensor(output, layer_index, "down_proj_output")
+            in_res = capture_tensor(inputs[0], layer_index, "down_proj_input", return_sink=True)
+            if isinstance(in_res, tuple):
+                in_arr, in_sink = in_res
+                catcher.sink_input = in_sink
+            else:
+                in_arr = in_res
             self._inputs["down_proj"][layer_index] = in_arr
+
+            out_res = capture_tensor(output, layer_index, "down_proj_output", return_sink=True)
+            if isinstance(out_res, tuple):
+                out_arr, out_sink = out_res
+                catcher.sink_output = out_sink
+            else:
+                out_arr = out_res
             self._outputs["down_proj"][layer_index] = out_arr
 
         return hook

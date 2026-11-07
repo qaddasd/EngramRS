@@ -10,7 +10,12 @@ from .base import capture_tensor
 class AttentionCatcher:
     """Specialized catcher for attention o_proj inputs and outputs."""
 
-    def __init__(self, layer_index: int, input_layernorm: nn.Module, o_proj: nn.Module) -> None:
+    def __init__(
+        self,
+        layer_index: int,
+        input_layernorm: nn.Module | None,
+        o_proj: nn.Module,
+    ) -> None:
         self.layer_index = layer_index
         self.input_layernorm = input_layernorm
         self.o_proj = o_proj
@@ -24,14 +29,14 @@ class AttentionCatcher:
             del module, inputs
             if self.captured_input is not None:
                 raise RuntimeError(
-                    f"decoder layer {self.layer_index} produced self_attn.o_proj input more than once; "
+                    f"decoder layer {self.layer_index} produced input_layernorm activations more than once; "
                     "EngramContextCatcher captures exactly one pass"
                 )
-            res = capture_tensor(output, self.layer_index, "o_proj_input", return_sink=True)
-            if isinstance(res, tuple):
-                self.captured_input, self.sink_input = res
+            in_res = capture_tensor(output, self.layer_index, "input_layernorm", return_sink=True)
+            if isinstance(in_res, tuple):
+                self.captured_input, self.sink_input = in_res
             else:
-                self.captured_input = res
+                self.captured_input = in_res
 
         return hook
 
@@ -40,14 +45,14 @@ class AttentionCatcher:
             del module, inputs
             if self.captured_output is not None:
                 raise RuntimeError(
-                    f"decoder layer {self.layer_index} produced self_attn.o_proj output more than once; "
+                    f"decoder layer {self.layer_index} produced self_attn.o_proj activations more than once; "
                     "EngramContextCatcher captures exactly one pass"
                 )
-            res = capture_tensor(output, self.layer_index, "o_proj_output", return_sink=True)
-            if isinstance(res, tuple):
-                self.captured_output, self.sink_output = res
+            out_res = capture_tensor(output, self.layer_index, "o_proj_output", return_sink=True)
+            if isinstance(out_res, tuple):
+                self.captured_output, self.sink_output = out_res
             else:
-                self.captured_output = res
+                self.captured_output = out_res
 
         return hook
 

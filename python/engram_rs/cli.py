@@ -68,6 +68,7 @@ def cmd_compile(args: argparse.Namespace) -> int:
     print(f"[EngramRS] Loaded input context ({len(context_text)} characters).")
 
     compiler = EngramCompiler(model, tokenizer)
+    raw_targets = tuple(t.strip() for t in args.targets.split(",") if t.strip())
 
     if args.stream:
         print(f"[EngramRS] Streaming compilation (chunk_size={args.chunk_size}, rank={args.rank}) ...")
@@ -79,11 +80,14 @@ def cmd_compile(args: argparse.Namespace) -> int:
             lambda_reg=args.lambda_reg,
         )
     else:
-        print(f"[EngramRS] Standard zero-copy compilation (rank={args.rank}) ...")
+        print(f"[EngramRS] Standard zero-copy compilation (rank={args.rank}, targets={raw_targets}) ...")
         out_dir = compiler.compile_text(
             context_text,
             output_dir=args.output,
             rank=args.rank,
+            targets=raw_targets,
+            lambda_reg=args.lambda_reg,
+            lambda_null=args.lambda_null,
         )
 
     compile_time = compiler.last_compile_time_ms or 0.0

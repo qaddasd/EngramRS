@@ -2,20 +2,35 @@ use ahash::AHasher;
 use faer::Mat;
 use std::hash::Hasher;
 
-/// Deterministically generate 64 random hyperplanes for SimHash LSH in dimension `d`.
+/// Deterministically generate 64 random Gaussian hyperplanes for SimHash LSH in dimension `d`.
 ///
-/// Uses a 64-bit linear congruential generator (Knuth / MMIX parameters) with a fixed seed
-/// to guarantee bitwise reproducibility across runs and platforms without external dependencies.
+/// Uses standard Box-Muller transform on a 64-bit linear congruential generator (Knuth / MMIX parameters)
+/// to sample isotropic N(0, I) Gaussian normal variates, guaranteeing true spherical projection invariance.
 pub fn generate_simhash_hyperplanes(d: usize) -> Vec<f32> {
     let total_elements = 64 * d;
     let mut planes = Vec::with_capacity(total_elements);
     let mut state = 0x9e37_79b9_7f4a_7c15_u64;
-    for _ in 0..total_elements {
+
+    let mut i = 0;
+    while i < total_elements {
         state = state
             .wrapping_mul(6_364_136_223_846_793_005)
             .wrapping_add(1_442_695_040_888_963_407);
-        let unit = (state >> 40) as f32 / ((1_u64 << 24) - 1) as f32;
-        planes.push(2.0 * unit - 1.0);
+        let u1 = ((state >> 32) as f32 + 1.0) / (4_294_967_296.0 + 2.0);
+
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let u2 = ((state >> 32) as f32 + 1.0) / (4_294_967_296.0 + 2.0);
+
+        let r = (-2.0 * u1.ln()).sqrt();
+        let theta = 2.0 * std::f32::consts::PI * u2;
+        planes.push(r * theta.cos());
+        i += 1;
+        if i < total_elements {
+            planes.push(r * theta.sin());
+            i += 1;
+        }
     }
     planes
 }

@@ -79,20 +79,53 @@ impl FrequentDirectionsSketch {
         Ok(())
     }
 
-    /// Compress the sketch by computing thin SVD of buffer_x and projecting buffer_y
-    /// onto the singular subspace with scale balancing to avoid cross-covariance attenuation.
+    /// Compress the sketch using Joint Frequent Directions on Z = [X | \gamma Y].
+    ///
+    /// Balances Frobenius norms between X and Y to avoid asymmetric eigenvalue masking,
+    /// shrinks singular values by \delta = \sigma_m^2, and retains exact joint spectral bounds.
     pub fn compress(&mut self) -> Result<(), String> {
         if self.current_rows <= self.m {
             return Ok(());
         }
-        let active_x = self.buffer_x.submatrix(0, 0, self.current_rows, self.d_in);
-        let active_y = self.buffer_y.submatrix(0, 0, self.current_rows, self.d_out);
 
-        // Thin SVD of active_x: active_x = U_x * \Sigma_x * V_x^T
-        let svd_x = active_x.thin_svd();
-        let u = svd_x.u();
-        let s = svd_x.s_diagonal();
-        let v = svd_x.v();
+        let n = self.current_rows;
+        let d_total = self.d_in + self.d_out;
+
+        // Compute Frobenius norms to determine balance multiplier \gamma
+        let mut norm_x_sq = 0.0f64;
+        for r in 0..n {
+            for c in 0..self.d_in {
+                let v = self.buffer_x.read(r, c) as f64;
+                norm_x_sq += v * v;
+            }
+        }
+        let mut norm_y_sq = 0.0f64;
+        for r in 0..n {
+            for c in 0..self.d_out {
+                let v = self.buffer_y.read(r, c) as f64;
+                norm_y_sq += v * v;
+            }
+        }
+
+        let gamma = if norm_y_sq > 1e-12 {
+            ((norm_x_sq / self.d_in as f64) / (norm_y_sq / self.d_out as f64 + 1e-12)).sqrt() as f32
+        } else {
+            1.0f32
+        };
+
+        // Form joint matrix Z = [X | \gamma Y] of shape [n, d_in + d_out]
+        let joint_z = Mat::from_fn(n, d_total, |r, c| {
+            if c < self.d_in {
+                self.buffer_x.read(r, c)
+            } else {
+                gamma * self.buffer_y.read(r, c - self.d_in)
+            }
+        });
+
+        // Thin SVD of joint Z: Z = U * \Sigma * V^T
+        let svd_z = joint_z.thin_svd();
+        let s = svd_z.s_diagonal();
+        let v = svd_z.v();
         let n_s = s.nrows();
 
         let delta = if n_s > self.m {
@@ -103,7 +136,9 @@ impl FrequentDirectionsSketch {
         };
 
         let keep = self.m.min(n_s);
-        let mut new_s = Vec::with_capacity(keep);
+        let inv_gamma = 1.0f32 / gamma;
+
+        // Write shrunk sketch rows B_i = \tilde{\sigma}_i * V_{:, i}^T
         for i in 0..keep {
             let si = s.read(i);
             let si_sq = si * si;
@@ -112,43 +147,22 @@ impl FrequentDirectionsSketch {
             } else {
                 0.0
             };
-            new_s.push(shrunk);
-        }
 
-        // Project active_y onto U_x submatrix before overwriting buffers:
-        // projected_y = U_x[:, 0..keep]^T * active_y
-        let u_sub = u.submatrix(0, 0, self.current_rows, keep);
-        let projected_y = u_sub.transpose() * active_y; // shape: [keep, d_out]
-
-        // Write shrunk X directions: B_x[i, :] = \tilde{\sigma}_i * v_i^T
-        for (i, &scale) in new_s.iter().enumerate().take(keep) {
-            for j in 0..self.d_in {
-                self.buffer_x.write(i, j, scale * v.read(j, i));
+            for c in 0..self.d_in {
+                self.buffer_x.write(i, c, shrunk * v.read(c, i));
+            }
+            for c in 0..self.d_out {
+                self.buffer_y.write(i, c, inv_gamma * (shrunk * v.read(self.d_in + c, i)));
             }
         }
+
+        // Zero out remaining rows
         for i in keep..(2 * self.m) {
-            for j in 0..self.d_in {
-                self.buffer_x.write(i, j, 0.0);
+            for c in 0..self.d_in {
+                self.buffer_x.write(i, c, 0.0);
             }
-        }
-
-        // Apply scale-balanced projection for Y:
-        // B_y[i, :] = (\sigma_i / \tilde{\sigma}_i) * projected_y[i, :]
-        // so that B_x^T B_y = V_x \tilde{\Sigma}_x B_y == V_x \Sigma_x U_x^T active_y
-        for (i, &shrunk_s) in new_s.iter().enumerate().take(keep) {
-            let orig_s = s.read(i);
-            let factor = if shrunk_s > 1e-12 {
-                (orig_s / shrunk_s).min(1e3)
-            } else {
-                0.0
-            };
-            for j in 0..self.d_out {
-                self.buffer_y.write(i, j, factor * projected_y.read(i, j));
-            }
-        }
-        for i in keep..(2 * self.m) {
-            for j in 0..self.d_out {
-                self.buffer_y.write(i, j, 0.0);
+            for c in 0..self.d_out {
+                self.buffer_y.write(i, c, 0.0);
             }
         }
 

@@ -1,7 +1,7 @@
 """Export PEFT / Engram safetensors LoRA adapters into GGUF LoRA format.
 
 Compatible with llama.cpp (e.g. `llama-cli -m model.gguf --lora adapter.gguf`)
-and Ollama (`ollama run ... --lora adapter.gguf`).
+and Ollama (via Modelfile `ADAPTER adapter.gguf`).
 
 Includes a robust, zero-dependency pure-Python GGUF v3 writer and reader.
 """

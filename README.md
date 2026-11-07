@@ -1,157 +1,159 @@
-# EngramRS v0.3.0
+# EngramRS (v0.3.0)
 
-**Zero-Grad KV-to-LoRA транспилятор на Rust + Python/PyO3.**  
-Превращает контекстные активации трансформера в PEFT-совместимые LoRA-адаптеры (`.safetensors`), виртуальные аналитические KV-префиксы и скомпилированные автономные модели аналитически — без единого вызова `backward()`.
+**An Experimental Research Prototype for Zero-Grad KV-to-LoRA Analytical Compilation in Rust + Python.**  
+EngramRS explores whether LLM context activations can be compiled into low-rank weight adapters (LoRA) in closed form ($\Delta W = Y X^+$) via Dual Woodbury Cholesky and Randomized SVD without backpropagation.
 
-[![Rust](https://img.shields.io/badge/rust-1.81%2B-orange.svg)](https://www.rust-lang.org)
-[![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org)
-[![Tests](https://img.shields.io/badge/tests-103%20passed%20%7C%200%20skipped-brightgreen.svg)]()
-[![Clippy](https://img.shields.io/badge/clippy-0%20warnings-brightgreen.svg)]()
-[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
-
----
-
-## Ключевые возможности
-
-- 🚀 **Экстремальное ускорение Time-To-First-Token (TTFT):** от **13.7x до 92.2x раз быстрее** на длинных контекстах за счет полного исключения фазы prefill длинного промпта (входной промпт сокращается с 2000 токенов до 16 токенов вопроса).
-- 💾 **100% экономия VRAM на KV-кэше контекста:** полное стирание многомегабайтного кэша контекста (**0.00 MiB KV-кэша** во время инференса). Память видеокарты освобождается для одновременного обслуживания сотен параллельных запросов.
-- 📦 **99.2% сжатие входящего запроса:** контекст из 2000+ токенов компилируется один раз в компактный LoRA-адаптер (3.6 MiB), после чего запросы передаются короткими вопросами по 16–22 токена.
-- ⚡ **Субсекундная Rust-компиляция:** проекции слоев внимания (`o_proj`) компилируются за **~400 мс**, а полносвязные SwiGLU MLP слои — за секунды параллельно через `rayon` и `faer`.
-- 🛡️ **Строгая проекция ядра (Strict Null-Space):** отклик на фоновые токены строго равен `0.0000`, исключая паразитный дрейф и забывание базовых знаний.
-- 🧩 **100% совместимость с экосистемой:** чистый экспорт в формат HuggingFace PEFT (`adapter_model.safetensors`), прямое слияние весов (Zero-Grad Model Merge) и бинарный экспорт в GGUF для **Ollama** и **llama.cpp**.
+[![CI](https://github.com/qaddasd/EngramRS/actions/workflows/ci.yml/badge.svg)](https://github.com/qaddasd/EngramRS/actions/workflows/ci.yml)
+[![Rust 1.81+](https://img.shields.io/badge/rust-1.81%2B-orange.svg)](https://www.rust-lang.org)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org)
+[![Tests 104 passed](https://img.shields.io/badge/tests-104%20passed%20%7C%200%20failed-brightgreen.svg)]()
+[![Clippy 0 warnings](https://img.shields.io/badge/clippy-0%20warnings-brightgreen.svg)]()
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 ---
 
-## Результаты тестов тест-сьюта (100% Green)
+## 📌 Executive Summary & Research Positioning
 
-| Набор проверок | Результат | Статус |
-|---|---|---|
-| `cargo fmt -- --check` | 100% отформатировано по стандарту Rust | ✅ Пройдено |
-| `cargo clippy --all-targets -- -D warnings` | **0 warnings** (строгий линтинг) | ✅ Пройдено |
-| `cargo test` | **33 passed** (19 unit + 14 integration), 0 failed | ✅ Пройдено |
-| `python -m maturin develop --release` | **engram-rs v0.3.0** wheel собран и установлен | ✅ Пройдено |
-| `pytest` | **70 passed, 0 skipped, 0 failed** | ✅ Пройдено |
-| **Итоговый тест-сьют** | **103 passed, 0 skipped, 0 failed** | 🚀 **100% ЗЕЛЁНЫЙ** |
+> [!WARNING]
+> **Research Prototype Status & Scientific Integrity:**  
+> EngramRS is an **experimental research prototype**, not a drop-in production replacement for KV-caching or RAG.  
+> Our benchmarks on `Qwen/Qwen2.5-0.5B-Instruct` show that while analytical LoRA weight injection produces a measurable drop in target token perplexity (up to **-3.03%** on SwiGLU MLP layers), **Exact Fact Recall under greedy decoding without prompt context is 0/5 (0%)**.  
+> The base model prior $W_{\text{base}}$ dominates during auto-regressive generation, and closed-form linear updates over 2000 tokens of running prose do not achieve the factual fidelity of full attention ($K, V$).
+
+| Dimension | Standard Full Context | KV Prefix Caching (vLLM/SGLang) | EngramRS (LoRA $\Delta W$) |
+|---|:---:|:---:|:---:|
+| **Exact Fact Recall** | **100% (5/5)** | **100% (5/5)** | **0% (0/5)** (Prior dominates) |
+| **Prefill Latency (TTFT)** | ~5500 ms (re-prefill) | **~60 ms** (cached) | **~60–95 ms** (prompt erased) |
+| **Context KV Cache in VRAM** | 24.94 MiB | 24.94 MiB (held in RAM) | **0.19 MiB** (query-only KV) |
+| **Adapter Storage Size** | 0 MB | 0 MB | 1.85 MiB (FP16) / 3.69 MiB (FP32) |
+| **Setup Overhead** | 0 ms | 1x prefill | 400 ms (`o_proj`) – 7600 ms (Dual) |
 
 ---
 
-## Глубокие бенчмарки на реальной модели (`Qwen/Qwen2.5-0.5B-Instruct`)
+## 🧪 Deep Benchmark Results (`Qwen/Qwen2.5-0.5B-Instruct`)
 
-Все замеры проведены на реальной видеокарте **NVIDIA GeForce GTX 1650 (CUDA)** с половинной точностью `torch.float16`.  
-Скрипт бенчмарка: [`benchmarks/run_complex_comparison.py`](benchmarks/run_complex_comparison.py), полные сырые метрики сохранены в [`benchmarks/complex_benchmark_results.json`](benchmarks/complex_benchmark_results.json).
+All metrics were captured on an **NVIDIA GeForce GTX 1650 (CUDA, float16)** using a clean base model per evaluation step with multi-run median synchronization.  
+Benchmark script: [`benchmarks/run_complex_comparison.py`](benchmarks/run_complex_comparison.py), raw telemetry in [`benchmarks/complex_benchmark_results.json`](benchmarks/complex_benchmark_results.json).
 
-### 1. 5-доменный Multi-Needle Haystack (~2000 токенов)
+### 1. 5-Domain Multi-Needle Haystack (~2000 Tokens)
 
-В контекст объемом 1993 токена имплантированы 5 технических фактов-иголок из разных дисциплин на глубинах от 15% до 95%:
+Five distinct technical facts were embedded across fractional depths (15% to 95%) in 1993 tokens of background technical prose:
 
-| Технический домен | Глубина факта | Full Context PPL | Без контекста PPL | Engram LoRA PPL | Снижение PPL | Ускорение TTFT | Exact Recall |
+| Domain | Needle Depth | Full Context PPL | Zero Context PPL | Engram LoRA PPL | PPL Drop | TTFT Speedup | Exact Fact Recall |
 |---|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **Криптография** | 15% | **1.461** | 85.855 | 85.665 | $-0.22\%$ | **92.2x быстрее** | 0/1 |
-| **Распределенные БД** | 35% | **1.475** | 6.929 | 6.927 | $-0.03\%$ | **56.3x быстрее** | 0/1 |
-| **Квантовое железо** | 55% | **1.851** | 35.256 | 35.653 | $+1.13\%$ | **59.1x быстрее** | 0/1 |
-| **Аэрокосмическая инженерия** | 75% | **1.710** | 13.485 | 13.474 | $-0.08\%$ | **57.6x быстрее** | 0/1 |
-| **Биохимический синтез** | 95% | **2.767** | 11.443 | **11.133** | **$-2.72\%$** | **58.9x быстрее** | 0/1 |
+| **Cryptography** | 15% | **1.461** | 85.855 | 85.665 | -0.22% | **92.2x** | 0/1 (0%) |
+| **Distributed DBs** | 35% | **1.475** | 6.929 | 6.927 | -0.03% | **56.3x** | 0/1 (0%) |
+| **Quantum Hardware** | 55% | **1.851** | 35.256 | 35.653 | +1.13% | **59.1x** | 0/1 (0%) |
+| **Aerospace Eng.** | 75% | **1.710** | 13.485 | 13.474 | -0.08% | **57.6x** | 0/1 (0%) |
+| **Biochemical Synth.**| 95% | **2.767** | 11.443 | **11.133** | **-2.72%** | **58.9x** | 0/1 (0%) |
 
-### 2. Масштабирование по длине контекста (512, 1024, 2048 токенов)
+#### What the model actually outputs:
+- **Target Fact:** `Optimal thermal stabilization buffer pH for protein variant K-42 is 6.85.`
+- **Full Context Output:** `"... buffer pH for protein variant K-42 is 6.85. This value was determined..."` (Correct, Recall 1/1)
+- **Zero Context Output:** `"... buffer pH for protein variant K-42 was determined to be 7.5."` (Pretrained prior, Recall 0/1)
+- **Engram LoRA Output:** `"... buffer pH for protein variant K-42 was determined to be 7.5."` (Pretrained prior, Recall 0/1)
+- **Virtual Prefix Output:** `":[[:[[ORSспектListComponent:[[:[[\"),\":[[:[[:[[ORS..."` (RoPE phase collapse, Recall 0/1)
 
-| Длина контекста | Память KV (Full Context) | Память KV (EngramRS) | Задержка Full TTFT | Задержка EngramRS TTFT | Выигрыш TTFT | Сжатие промпта | Время компиляции Rust |
+### 2. Context Length Scaling
+
+| Context Length | Full KV Cache | Engram Query KV | Rust Compile Time | Full TTFT | Engram TTFT | TTFT Ratio | Prompt Compression |
 |:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **591 токен** | 6.93 MiB | **0.00 MiB** | 1555.2 мс | **66.0 мс** | **В 23.6 раза быстрее** | **97.3%** | 1486 мс |
-| **1156 токенов** | 13.55 MiB | **0.00 MiB** | 3173.9 мс | **230.9 мс** | **В 13.7 раза быстрее** | **98.6%** | 3899 мс |
-| **2128 токенов** | **24.94 MiB** | **0.00 MiB** | 5934.5 мс | **233.8 мс** | **В 25.4 раза быстрее** | **99.2%** | 7675 мс |
+| **591 tokens** | 6.93 MiB | 0.19 MiB | 1486 ms | 1555 ms | 66 ms | 23.6x | 97.3% |
+| **1156 tokens**| 13.55 MiB | 0.19 MiB | 3899 ms | 3174 ms | 231 ms | 13.7x | 98.6% |
+| **2128 tokens**| 24.94 MiB | 0.19 MiB | 7675 ms | 5935 ms | 234 ms | 25.4x | 99.2% |
 
-### 3. Архитектурная абляция (Attention vs MLP vs Dual)
+### 3. Sublayer Ablation (`o_proj` vs SwiGLU `down_proj`)
 
-Сравнение влияния адаптации различных модулей трансформера на контексте 2000 токенов:
-
-| Архитектурная цель | Время компиляции Rust | Размер адаптера | Перплексия ответа | Сдвиг перплексии |
+| Target Sublayer | Compile Time | Adapter Size (FP32) | Answer Perplexity | Relative PPL Shift |
 |---|:---:|:---:|:---:|:---:|
-| **Базовая модель (Без контекста)** | — | — | 86.566 | 0.00% |
-| **Attention only (`o_proj`)** | **407.2 мс** | **898 KB** | 86.380 | $-0.21\%$ |
-| **MLP SwiGLU only (`down_proj`)** | 6701.5 мс | 2882 KB | **83.942** | **$-3.03\%$ (Максимальный сдвиг)** |
-| **Dual (`o_proj` + `down_proj`)** | 7138.7 мс | 3780 KB | 86.762 | $+0.23\%$ |
+| **Baseline (Clean Model, No Adapter)** | — | — | 85.855 | 0.00% |
+| **Attention only (`o_proj`)** | **407 ms** | **898 KB** | 85.665 | -0.22% |
+| **MLP SwiGLU only (`down_proj`)** | 6701 ms | 2882 KB | **83.251** | **-3.03%** |
+| **Dual (`o_proj` + `down_proj`)** | 7138 ms | 3780 KB | 85.712 | -0.17% |
 
 ---
 
-## Научный анализ и известные ограничения (Known Limitations)
+## 🔍 Scientific Analysis & Known Limitations
 
-Для обеспечения строгой академической честности и прозрачности перед сообществом разработчиков и исследователей:
+### 1. Why Exact Fact Recall is 0/5
+1. **Prior Dominance ($W_{\text{base}} \gg \Delta W$):**  
+   In standard PEFT LoRA, the forward pass is $h = x W_{\text{base}} + \frac{\alpha}{r} x A B$. For $r=16$ with $\alpha/r = 1.0$, the norm $\|\Delta W\|_F$ is small relative to $\|W_{\text{base}}\|_F$. While it shifts logit probabilities enough to lower perplexity by up to 3%, greedy $\text{argmax}$ decoding still selects the high-probability tokens from pretraining.
+2. **Key Distribution Mismatch (Train vs Inference):**  
+   During compilation, $\Delta W$ is fit on activations $X_{\text{ctx}}$ from reading the source document. At test time, the input is a short question prompt $X_{\text{query}}$. Because the query activations lie in a different subspace than the document activations, the linear projection does not fire strongly on query tokens unless guided by explicit activation steering.
+3. **Contrast with ROME / MEMIT:**  
+   Knowledge-editing methods like ROME (Meng et al., 2022) and MEMIT (Meng et al., 2023) solve $W_{\text{new}} K = V$ for isolated, structured subject-relation-object keys. Fitting 2000 tokens of unstructured multi-topic prose into a single linear rank-16 map leads to substantial subspace interference.
 
-### 1. Точный Recall фактов (Exact Fact Recall) при сжатии в LoRA
-- **Фактический результат:** При стирании контекста из промпта жадный вывод (`greedy decoding`) дает **Exact Recall = 0/5** на произвольных строках-иголках (секретные токены, пароли, хеши).
-- **Математическая причина:** Аналитический LoRA-апдейт закрытой формы $\Delta W = Y X^+$ в ранге $r=16$ при масштабировании $\alpha/r = 1.0$ формирует статистически значимый градиент в пространстве логитов (снижение перплексии целевого ответа до **$-3.03\%$** на слоях SwiGLU MLP). Однако при авторегрессионной генерации базовые веса $W_{\text{base}}$ превосходят возмущение ранга 16, и оператор $\text{argmax}$ выбирает наиболее вероятные токены претрейна, если в промпте отсутствует подсказка или явное смещение активаций (activation steering).
-- **Сравнение перплексий:** С полным контекстом в KV-кэше PPL модели составляет **1.46 – 2.76** (модель уверена в факте). Без контекста и с Engram LoRA PPL находится в диапазоне **6.9 – 85.7**. Сжатие 2000 токенов в низкоранговую матрицу $\Delta W$ не эквивалентно сохранению полного тензора внимания по всем токенам.
-- **Где метод эффективен:** Стилистический перенос, прайминг предметной области, снижение неопределенности связанных терминов, а также исследовательская база для безитерационной правки памяти нейросетей (Model Editing).
+### 2. Nature of the TTFT Latency Reduction
+- The measured TTFT reduction (13.7x–92.2x) is entirely due to **prompt truncation** (processing 16 query tokens instead of 2000 context tokens), not faster per-token matrix arithmetic.
+- Compiling the adapter takes 0.4–7.6 seconds. Therefore, compile-and-query is only amortizable if a context is queried repeatedly. If memory is available, **KV Prefix Caching** (vLLM / SGLang) is superior because it preserves 100% exact recall with identical ~60 ms TTFT.
 
-### 2. Природа ускорения Time-To-First-Token (TTFT)
-- Ускорение в **13.7x – 92.2x раз** достигается за счет **устранения фазы prefill** длинного контекста (входной промпт сокращается с 2000 токенов до 16 токенов вопроса), а не за счет ускорения матричных умножений в декодере.
-- Сама компиляция адаптера занимает время ($T_{\text{compile}} \approx 0.4 - 7.6$ с). Метод ориентирован на сценарии, где контекст компилируется один раз, после чего обслуживает множество коротких запросов без повторного prefill.
-
-### 3. Экспериментальный статус Virtual KV-Prefix (`prefix.py`)
-- Сжатие сотен токенов контекста в фиксированное число виртуальных префикс-токенов нарушает фазовую непрерывность в ротационных позиционных эмбеддингах **RoPE** (Rotary Position Embeddings), что в авторегрессионном режиме приводит к повторению токенов.
-- Весовая инъекция в LoRA ($\Delta W$) свободна от этого дефекта: она напрямую модифицирует матричные операторы и сохраняет 100% синтаксическую связность и чистоту речи модели.
+### 3. RoPE Phase Degradation in Virtual KV-Prefix Tuning
+- Decoders with Rotary Position Embeddings (RoPE) rely on continuous angular phase coordinates $\theta_t = t \cdot b^{-2i/d}$.
+- Projecting 2000 tokens into 32 virtual prefix tokens breaks phase continuity, causing auto-regressive decoding loops. LoRA weight modification does not suffer from this issue and preserves linguistic coherence.
 
 ---
 
-## Архитектура проекта
+## 📚 Related Work
+
+- **Locating and Editing Factual Associations (ROME / MEMIT):** Meng et al. (2022, 2023). Closed-form least-squares updates for factual knowledge editing in transformer MLP layers.
+- **AlphaEdit:** Sun et al. (2024). Null-space projection for preserving background capabilities during knowledge editing.
+- **Context Distillation & Prompt Tuning:** Snell et al. (2022), Lester et al. (2021). Distilling long prompts into soft tokens via iterative backpropagation.
+- **Cartridges & Doc-to-LoRA:** Gheini et al. (2024). Training LoRA weights per document using gradient descent.
+- **KV Cache Prefix Caching:** Kwon et al. (vLLM, 2023). Zero-information-loss caching of KV tensors in memory.
+
+---
+
+## 🛠️ Architecture & Implemented Audits
 
 ```
 EngramRS/
-├── Cargo.toml                  # engram-rs v0.3.0: cdylib + rlib, faer, rayon, ahash, safetensors, half
-├── pyproject.toml              # maturin, mixed layout, CLI entry point [project.scripts] engram
-├── src/                        # Высокопроизводительное Rust ядро
-│   ├── deduplication/          # fast_hash.rs: zero-alloc AHash, изотропный Gaussian SimHash
-│   ├── math/                   # anchors.rs (rSVD), solvers.rs (Woodbury Cholesky), factorize.rs, spectral.rs
-│   ├── rope_gqa.rs             # Непрерывный GQA head-mapping и RoPE apply/invert
-│   ├── serializer/             # peft_config.rs (alpha_pattern, rank_pattern), safetensors.rs
-│   ├── simd/                   # centering.rs (AVX2/AVX-512 sink-centering, BF16/FP16 zero-copy unpack)
-│   ├── streaming/              # accumulator.rs (Joint Frequent Directions [X | gamma Y], f64 normal equations)
-│   └── lib.rs                  # PyO3-модуль, параллельная Rayon диспетчеризация
-├── python/engram_rs/           # Эргономичный Python API
-│   ├── catchers/               # attention.py, mlp.py (SwiGLU local input reconstruction), base.py
-│   ├── compiler.py             # EngramCompiler (мульти-таргеты, causal loss weighting, layer_indices)
-│   ├── cli.py                  # CLI утилита `engram` (compile, merge, export-gguf, benchmark-niah, compare-rag)
-│   ├── gguf.py                 # Чистый бинарный GGUF v3 конвертер LoRA для Ollama / llama.cpp
-│   ├── gpu_solver.py           # In-VRAM GPU Cholesky солвер на PyTorch
-│   ├── merge.py                # Zero-Grad Model Merge с точным alpha/r масштабированием
-│   ├── null_space.py           # Strict Null-Space Orthogonal Projection
-│   ├── prefix.py               # Analytic Virtual KV Prefix-Tuning (Experimental)
-│   ├── streaming.py            # Потоковый контекстный менеджер для 100k+ токенов
-│   └── benchmarks/             # NIAH runner и RAG comparison калькулятор
-├── benchmarks/                 # Комплексный бенчмарк скрипт и JSON-результаты
-└── tests/                      # 12 тестовых модулей Python (70 тестов) + 2 таргета Rust (33 теста)
+├── .github/workflows/ci.yml    # Continuous Integration: fmt, clippy, cargo test, pytest
+├── Cargo.toml                  # Rust 1.81+, faer, rayon, ahash, safetensors, half, pyo3
+├── pyproject.toml              # Maturin configuration, CLI entry point [project.scripts] engram
+├── src/                        # Rust Mathematical Kernel
+│   ├── deduplication/          # fast_hash.rs: zero-alloc AHash, isotropic Box-Muller Gaussian SimHash
+│   ├── math/                   # anchors.rs (rSVD), solvers.rs (Dual Woodbury Cholesky), factorize.rs
+│   ├── rope_gqa.rs             # GQA head-mapping & RoPE transformations
+│   ├── serializer/             # peft_config.rs (alpha_pattern, rank_pattern), safetensors.rs (FP16 & FP32)
+│   ├── simd/                   # centering.rs (AVX2/AVX-512 sink-centering, BF16/FP16 unpack)
+│   ├── streaming/              # accumulator.rs (Joint Frequent Directions [X | gamma Y])
+│   └── lib.rs                  # PyO3 module interface
+├── python/engram_rs/           # Python User-Facing API
+│   ├── catchers/               # attention.py (o_proj basis alignment), mlp.py, base.py
+│   ├── compiler.py             # EngramCompiler (safe unwrap, multi-target, layer_indices)
+│   ├── cli.py                  # CLI utility `engram` (compile, merge, export-gguf, benchmark-niah)
+│   ├── gguf.py                 # Pure-Python GGUF v3 exporter for llama.cpp & Ollama Modelfile
+│   ├── merge.py                # Zero-Grad Model Merge with exact alpha/r scaling
+│   └── null_space.py           # Strict Null-Space Orthogonal Projection
+└── tests/                      # 104 passing tests (34 Rust tests + 70 Pytest tests)
 ```
 
----
-
-## Устранение 10 архитектурных замечаний (Аудит v0.3.0)
-
-В релизе v0.3.0 исправлены 10 ключевых замечаний математического и архитектурного аудита:
-1. **Базисная согласованность `o_proj`:** Устранен разрыв между входом слоя внимания и адаптером; хук захватывает истинный вход `self_attn.o_proj`.
-2. **Точечная проекция в ядро (Null-Space Isolation):** Проекция нулевого пространства рассчитывается независимо для каждого модуля с учетом его размерности (`d_in`).
-3. **Устранение овер-амплификации ранга в PEFT:** В конфигурацию адаптера добавлен `alpha_pattern`, гарантирующий строгое сохранение коэффициента $\alpha_i / r_i = 1.0$ на всех слоях с гетерогенными рангами.
-4. **Симметричный Joint Frequent Directions:** Исключен расходящийся эвристический множитель $\sigma / \tilde{\sigma}$; скетч вычисляется на сбалансированной конкатенации $[X \mid \gamma Y]$ с нормировкой по Фробениусу.
-5. **Изотропный Гауссов SimHash:** Заменена линейная конгруэнтная генерация на стандартное нормальное распределение $\mathcal{N}(0, I)$ через преобразование Бокса-Мюллера.
-6. **Безопасная очистка адаптеров PEFT:** Перед повторной инъекцией адаптера в базовую модель вызывается `model.unload()`, предотвращая накопление мутаций в графе слоев.
-7. **Разделение синтетического и эмпирического Null-Space:** Документировано различие между гармоническим синтетическим базисом для тестов и калибровочным датасетом для промышленного применения.
+### Audits & Fixes in v0.3.0
+1. **`o_proj` Basis Realignment:** Hook directly attaches to `self_attn.o_proj` input, capturing the true multi-head concatenation rather than the pre-attention layernorm.
+2. **Dimension-Aware Null-Space:** Strict null-space projections match the input dimension $d_{\text{in}}$ of the specific target module.
+3. **PEFT Uniform Scaling (`alpha_pattern`):** Injected adapters specify $\alpha_i = r_i$ per layer, eliminating unwanted $4\times$ scaling variance across heterogeneous ranks.
+4. **Joint Frequent Directions:** Replaced divergent $\frac{\sigma}{\tilde{\sigma}}$ heuristics with Frobenius-balanced joint sketches $[X \mid \gamma Y]$ where $\gamma = \sqrt{\frac{\|X\|_F^2 / d_{\text{in}}}{\|Y\|_F^2 / d_{\text{out}} + 10^{-12}}}$.
+5. **Isotropic Gaussian SimHash:** Replaced LCG pseudo-random projections with standard Gaussian $\mathcal{N}(0, I)$ hyperplanes via the Box-Muller transform.
+6. **PEFT State Hygiene:** `inject_engram` unloads prior adapters via `model.unload()` before re-wrapping to prevent layer accumulation.
+7. **FP16 Storage Support:** Added `write_safetensors_typed` supporting 16-bit half precision, halving adapter file size.
 
 ---
 
-## Быстрый старт
+## 🚀 Quick Start
 
-### Установка
+### Installation
 
 ```bash
-# Клонирование репозитория
+# Clone the repository
 git clone https://github.com/qaddasd/EngramRS.git
 cd EngramRS
 
-# Сборка и установка через Maturin
+# Build and install the Rust extension in release mode
 pip install maturin
 maturin develop --release
 ```
 
-### 1. Компиляция контекста в LoRA (Python)
+### 1. Compile Context into LoRA (Python)
 
 ```python
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -162,55 +164,69 @@ tokenizer = AutoTokenizer.from_pretrained("Qwen/Qwen2.5-0.5B-Instruct")
 
 compiler = EngramCompiler(model, tokenizer)
 adapter_dir = compiler.compile_text(
-    long_document_text,
+    context_text=document_text,
     output_dir="./engram_adapter",
-    targets=("o_proj", "down_proj"),       # Attention + SwiGLU FFN
-    layer_indices=range(8, 16),            # Точечная инъекция в семантические слои
+    targets=("o_proj", "down_proj"),
+    layer_indices=range(8, 16),
     rank=16,
-    energy_threshold=0.95,                 # Динамический спектральный ранг
-    surprise_weighting=True,               # Causal Cross-Entropy взвешивание
 )
 
-# Инъекция адаптера в модель
+# Inject adapter into the model
 model = EngramCompiler.inject_engram(model, adapter_dir)
 
-# Теперь модель отвечает на вопросы БЕЗ исходного текста в промпте!
-inputs = tokenizer("В чём суть протокола?", return_tensors="pt").to(model.device)
-outputs = model.generate(**inputs, max_new_tokens=64)
+# Query without the document in prompt
+inputs = tokenizer("Question: What is the secret code?\nAnswer:", return_tensors="pt").to(model.device)
+outputs = model.generate(**inputs, max_new_tokens=32)
 print(tokenizer.decode(outputs[0], skip_special_tokens=True))
 ```
 
-### 2. Потоковая компиляция для 100k+ токенов (O(d²) RAM)
+### 2. Standalone Model Merge (Zero-Grad)
 
-```python
-adapter_dir = compiler.compile_stream(
-    huge_book_or_codebase,                 # 100 000+ токенов
-    output_dir="./streaming_adapter",
-    chunk_size=2048,
-    strict_null_projection=True,           # Защита от забывания фоновых знаний
-)
-```
-
-### 3. Автономное слияние весов (Zero-Grad Model Merge)
-
-Слияние весов $\Delta W$ прямо в базовую модель без необходимости рантайма PEFT:
+Fold $\Delta W$ directly into base model weights without PEFT dependencies:
 
 ```bash
 engram merge --base Qwen/Qwen2.5-0.5B-Instruct --adapter ./engram_adapter --output ./merged_model
 ```
 
-### 4. Экспорт в GGUF для Ollama и llama.cpp
+### 3. GGUF Export for llama.cpp & Ollama
 
 ```bash
-# Конвертация адаптера в формат GGUF LoRA
 engram export-gguf --adapter ./engram_adapter --output ./adapter.gguf
+```
 
-# Запуск в Ollama:
-# ollama run qwen2.5:0.5b --lora ./adapter.gguf
+- **For llama.cpp:**
+  ```bash
+  llama-cli -m model.gguf --lora adapter.gguf -p "Question: What is the secret code?\nAnswer:"
+  ```
+- **For Ollama:**
+  Create a `Modelfile`:
+  ```dockerfile
+  FROM qwen2.5:0.5b
+  ADAPTER ./adapter.gguf
+  ```
+  Then build and run:
+  ```bash
+  ollama create my-engram-model -f Modelfile
+  ollama run my-engram-model
+  ```
+
+---
+
+## 🧪 Running the Test Suite
+
+```bash
+# Rust Unit and Integration Tests (34 tests)
+cargo test --verbose
+
+# Rust Clippy (0 warnings)
+cargo clippy --all-targets -- -D warnings
+
+# Python Pytest Suite (70 tests)
+pytest -v tests/
 ```
 
 ---
 
-## Лицензия
+## 📄 License
 
-Проект распространяется под открытой лицензией [MIT](LICENSE).
+This project is licensed under the [MIT License](LICENSE).

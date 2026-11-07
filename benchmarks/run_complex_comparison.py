@@ -5,13 +5,14 @@ Compares:
 2. Zero Context Baseline (Context erased, no Engram adapter)
 3. EngramRS LoRA Memory Injection (Context erased, LoRA adapter active)
 4. EngramRS Virtual KV-Prefix (Context compressed into 32 virtual prefix tokens)
+5. Prefix Caching Reference (vLLM / SGLang concept: KV retained in VRAM)
 
 Evaluates:
-- TTFT (Time-To-First-Token latency in ms)
+- TTFT (Time-To-First-Token prefill latency in ms, median of multiple runs)
 - Prompt token compression ratio
-- KV-Cache VRAM usage (MiB)
+- KV-Cache VRAM usage (MiB, measured for both full and bare queries)
 - Target fact perplexity
-- Factual recall accuracy (%) across 5 distinct domains
+- Exact factual recall accuracy (%) across 5 distinct domains
 - Rust compilation latency (ms)
 - Scaling across context lengths (512, 1024, 2048 tokens)
 """
@@ -59,20 +60,47 @@ def cache_nbytes(cache: Any) -> int:
     return 0
 
 
-def measure_ttft(model: Any, inputs: dict[str, torch.Tensor], device: torch.device) -> float:
-    """Measure Time-To-First-Token in milliseconds with hardware synchronization."""
+def get_base_model(model_instance: Any) -> Any:
+    """Ensure model is unwrapped from any PEFT adapter layer."""
+    if hasattr(model_instance, "unload"):
+        try:
+            return model_instance.unload()
+        except Exception:
+            pass
+    if hasattr(model_instance, "get_base_model"):
+        try:
+            return model_instance.get_base_model()
+        except Exception:
+            pass
+    return model_instance
+
+
+def measure_ttft(
+    model: Any,
+    inputs: dict[str, torch.Tensor],
+    device: torch.device,
+    warmup_runs: int = 2,
+    measured_runs: int = 5,
+) -> float:
+    """Measure Time-To-First-Token prefill latency in ms via median of multiple synchronized runs."""
+    input_ids = inputs["input_ids"]
     synchronize(device)
-    t0 = time.perf_counter()
     with torch.no_grad():
-        model.generate(
-            **inputs,
-            max_new_tokens=1,
-            do_sample=False,
-            num_beams=1,
-            use_cache=True,
-        )
+        for _ in range(warmup_runs):
+            _ = model(input_ids)
     synchronize(device)
-    return (time.perf_counter() - t0) * 1000.0
+
+    latencies: list[float] = []
+    for _ in range(measured_runs):
+        synchronize(device)
+        t0 = time.perf_counter()
+        with torch.no_grad():
+            _ = model(input_ids)
+        synchronize(device)
+        latencies.append((time.perf_counter() - t0) * 1000.0)
+
+    latencies.sort()
+    return latencies[len(latencies) // 2]
 
 
 def compute_target_perplexity(
@@ -221,7 +249,6 @@ def build_multi_needle_context(
         paragraphs.append(BACKGROUND_PARAGRAPHS[idx % len(BACKGROUND_PARAGRAPHS)])
         idx += 1
 
-    # Insert needles sorted by depth in reverse order so indices remain stable
     sorted_needles = sorted(needles, key=lambda n: n["depth"], reverse=True)
     total_paras = len(paragraphs)
     for item in sorted_needles:
@@ -247,14 +274,14 @@ def run_benchmark() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device).eval()
-    model.generation_config.pad_token_id = tokenizer.pad_token_id
+    base_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device).eval()
+    base_model.generation_config.pad_token_id = tokenizer.pad_token_id
 
     # Warmup
     print("Warmup model on device...")
     warmup_ids = tokenizer("Hello", return_tensors="pt")["input_ids"].to(device)
     with torch.no_grad():
-        model(warmup_ids)
+        base_model(warmup_ids)
     synchronize(device)
 
     # =========================================================================
@@ -269,7 +296,7 @@ def run_benchmark() -> None:
     context_input = tokenizer(context_2k, return_tensors="pt")
     context_input = {k: v.to(device) for k, v in context_input.items()}
     with torch.no_grad():
-        backbone = getattr(model, "model", model)
+        backbone = getattr(base_model, "model", base_model)
         c_out = backbone(**context_input, use_cache=True)
         kv_cache_bytes = cache_nbytes(c_out.past_key_values)
         kv_cache_mib = kv_cache_bytes / (1024 * 1024)
@@ -278,9 +305,21 @@ def run_benchmark() -> None:
     if device.type == "cuda":
         torch.cuda.empty_cache()
 
-    # Compile with EngramRS
+    # Measure KV Cache for short bare query (~16 tokens)
+    sample_bare_prompt = f"Question: {TECHNICAL_DOMAINS[0]['question']}\nAnswer:"
+    sample_bare_input = {k: v.to(device) for k, v in tokenizer(sample_bare_prompt, return_tensors="pt").items()}
+    with torch.no_grad():
+        b_bare_out = backbone(**sample_bare_input, use_cache=True)
+        bare_kv_bytes = cache_nbytes(b_bare_out.past_key_values)
+        bare_kv_mib = bare_kv_bytes / (1024 * 1024)
+    del b_bare_out, sample_bare_input
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    # Compile with EngramRS from clean base model
     with tempfile.TemporaryDirectory() as tmp_dir:
-        compiler = EngramCompiler(model, tokenizer)
+        compiler = EngramCompiler(base_model, tokenizer)
         print("Compiling context into Engram LoRA adapter in Rust...")
         adapter_path = compiler.compile_text(
             context_2k,
@@ -295,8 +334,8 @@ def run_benchmark() -> None:
         adapter_mib = adapter_bytes / (1024 * 1024)
         print(f"Compilation finished in {compile_time_ms:.2f} ms! Adapter size: {adapter_mib:.3f} MiB\n")
 
-        # Inject adapter
-        adapted_model = EngramCompiler.inject_engram(model, adapter_path)
+        # Inject adapter into a clean copy/wrapper
+        adapted_model = EngramCompiler.inject_engram(base_model, adapter_path)
 
         # Prefix Tuner compilation
         tuner = EngramPrefixTuner(
@@ -312,13 +351,18 @@ def run_benchmark() -> None:
 
         # Evaluate across the 5 domains
         comparison_results = []
+        full_success_count = 0
+        bare_success_count = 0
+        engram_success_count = 0
+        prefix_success_count = 0
+
         for item in TECHNICAL_DOMAINS:
             domain = item["domain"]
             question = item["question"]
             expected = item["expected"]
             depth_pct = f"{int(item['depth']*100)}%"
 
-            # 1. Full In-Context (Traditional Prompting)
+            # 1. Full In-Context (Traditional Prompting on clean base model)
             full_prompt = f"{context_2k}\n\nQuestion: {question}\nAnswer:"
             full_inputs = {k: v.to(device) for k, v in tokenizer(full_prompt, return_tensors="pt").items()}
             full_tokens = full_inputs["input_ids"].shape[1]
@@ -328,8 +372,10 @@ def run_benchmark() -> None:
                 full_ppl = compute_target_perplexity(adapted_model, full_prompt, f" {expected}", tokenizer, device)
                 full_gen, full_lat = generate_text(adapted_model, full_inputs, tokenizer)
                 full_success = expected.lower() in full_gen.lower()
+                if full_success:
+                    full_success_count += 1
 
-            # 2. Baseline Erased (No Context, No Engram)
+            # 2. Baseline Erased (No Context, No Engram on clean base model)
             bare_prompt = f"Question: {question}\nAnswer:"
             bare_inputs = {k: v.to(device) for k, v in tokenizer(bare_prompt, return_tensors="pt").items()}
             bare_tokens = bare_inputs["input_ids"].shape[1]
@@ -339,34 +385,31 @@ def run_benchmark() -> None:
                 bare_ppl = compute_target_perplexity(adapted_model, bare_prompt, f" {expected}", tokenizer, device)
                 bare_gen, bare_lat = generate_text(adapted_model, bare_inputs, tokenizer)
                 bare_success = expected.lower() in bare_gen.lower()
+                if bare_success:
+                    bare_success_count += 1
 
             # 3. EngramRS (Context Erased, LoRA Active)
             engram_ttft = measure_ttft(adapted_model, bare_inputs, device)
             engram_ppl = compute_target_perplexity(adapted_model, bare_prompt, f" {expected}", tokenizer, device)
             engram_gen, engram_lat = generate_text(adapted_model, bare_inputs, tokenizer)
             engram_success = expected.lower() in engram_gen.lower()
+            if engram_success:
+                engram_success_count += 1
 
             ppl_drop = (bare_ppl - engram_ppl) / bare_ppl * 100.0
 
-            # 4. EngramRS Virtual KV Prefix (32 virtual tokens)
-            p_inputs = tuner.prepare_generate_inputs(bare_inputs["input_ids"], prefix_cache)
+            # 4. Virtual Prefix (32 tokens)
             with adapted_model.disable_adapter():
-                synchronize(device)
-                p_t0 = time.perf_counter()
-                with torch.no_grad():
-                    adapted_model.generate(**p_inputs, max_new_tokens=1, do_sample=False, num_beams=1)
-                synchronize(device)
-                prefix_ttft = (time.perf_counter() - p_t0) * 1000.0
-
-                p_gen_inputs = tuner.prepare_generate_inputs(bare_inputs["input_ids"], prefix_cache)
-                synchronize(device)
-                p_t1 = time.perf_counter()
-                with torch.no_grad():
-                    p_out = adapted_model.generate(**p_gen_inputs, max_new_tokens=24, do_sample=False, num_beams=1)
-                synchronize(device)
-                prefix_lat = (time.perf_counter() - p_t1) * 1000.0
-                prefix_gen = tokenizer.decode(p_out[0, bare_tokens:], skip_special_tokens=True).strip()
+                prefix_inputs = {
+                    "input_ids": bare_inputs["input_ids"],
+                    "past_key_values": prefix_cache,
+                    "use_cache": True,
+                }
+                prefix_ttft = measure_ttft(adapted_model, prefix_inputs, device)
+                prefix_gen, prefix_lat = generate_text(adapted_model, prefix_inputs, tokenizer)
                 prefix_success = expected.lower() in prefix_gen.lower()
+                if prefix_success:
+                    prefix_success_count += 1
 
             comparison_results.append({
                 "domain": domain,
@@ -402,17 +445,28 @@ def run_benchmark() -> None:
                 },
             })
 
+        # Clean unwrap adapted model
+        if hasattr(adapted_model, "unload"):
+            base_model = adapted_model.unload()
+
     # Print Table 1: Multi-Needle Per-Domain Results
-    print("=" * 115)
-    print(f"{'DOMAIN':<22} | {'DEPTH':<6} | {'FULL CTX PPL':<12} | {'NO CTX PPL':<12} | {'ENGRAM PPL':<12} | {'PPL DROP (%)':<12} | {'TTFT BOOST':<10}")
-    print("-" * 115)
+    print("=" * 125)
+    print(f"{'DOMAIN':<22} | {'DEPTH':<6} | {'FULL CTX PPL':<12} | {'NO CTX PPL':<12} | {'ENGRAM PPL':<12} | {'PPL DROP (%)':<12} | {'TTFT BOOST':<10} | {'RECALL'}")
+    print("-" * 125)
     for r in comparison_results:
         f = r["full"]
         b = r["bare"]
         e = r["engram"]
         ttft_speedup = f"{f['ttft_ms'] / e['ttft_ms']:.1f}x"
-        print(f"{r['domain']:<22} | {r['depth']:<6} | {f['ppl']:<12.3f} | {b['ppl']:<12.3f} | {e['ppl']:<12.3f} | {e['ppl_drop']:<12.2f}% | {ttft_speedup:<10}")
-    print("=" * 115)
+        recall_tag = "1/1" if e["success"] else "0/1"
+        print(f"{r['domain']:<22} | {r['depth']:<6} | {f['ppl']:<12.3f} | {b['ppl']:<12.3f} | {e['ppl']:<12.3f} | {e['ppl_drop']:<12.2f}% | {ttft_speedup:<10} | {recall_tag}")
+    print("=" * 125)
+
+    print("\nEXACT FACT RECALL ACCURACY SUMMARY:")
+    print(f"  • Full Context (KV {context_tokens}t) : {full_success_count} / {len(TECHNICAL_DOMAINS)} ({full_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
+    print(f"  • Without Context (Base)   : {bare_success_count} / {len(TECHNICAL_DOMAINS)} ({bare_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
+    print(f"  • With Engram (LoRA)       : {engram_success_count} / {len(TECHNICAL_DOMAINS)} ({engram_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
+    print(f"  • With Virtual Prefix (32t): {prefix_success_count} / {len(TECHNICAL_DOMAINS)} ({prefix_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
 
     print("\nSAMPLE GENERATIONS COMPARISON:")
     for r in comparison_results:
@@ -430,6 +484,10 @@ def run_benchmark() -> None:
     scaling_data = []
 
     for c_len in scaling_lengths:
+        # Guarantee clean un-adapted model
+        base_model = get_base_model(base_model)
+        backbone = getattr(base_model, "model", base_model)
+
         ctx = build_multi_needle_context(c_len, TECHNICAL_DOMAINS[:2], tokenizer)
         actual_tokens = len(tokenizer.encode(ctx))
 
@@ -446,12 +504,11 @@ def run_benchmark() -> None:
 
         full_q_prompt = f"{ctx}\n\nQuestion: {TECHNICAL_DOMAINS[0]['question']}\nAnswer:"
         full_q_inputs = {k: v.to(device) for k, v in tokenizer(full_q_prompt, return_tensors="pt").items()}
-        with (model.disable_adapter() if hasattr(model, "disable_adapter") else nullcontext()):
-            full_ttft = measure_ttft(model, full_q_inputs, device)
+        full_ttft = measure_ttft(base_model, full_q_inputs, device)
 
         # 2. EngramRS compilation and inference
         with tempfile.TemporaryDirectory() as s_dir:
-            c_inst = EngramCompiler(model, tokenizer)
+            c_inst = EngramCompiler(base_model, tokenizer)
             c_inst.compile_text(
                 ctx,
                 output_dir=s_dir,
@@ -465,8 +522,12 @@ def run_benchmark() -> None:
             q_bare_inputs = {k: v.to(device) for k, v in tokenizer(q_bare_prompt, return_tensors="pt").items()}
             bare_tokens = q_bare_inputs["input_ids"].shape[1]
 
-            engram_m = EngramCompiler.inject_engram(model, s_dir)
+            engram_m = EngramCompiler.inject_engram(base_model, s_dir)
             engram_ttft = measure_ttft(engram_m, q_bare_inputs, device)
+
+            # Clean unwrap
+            if hasattr(engram_m, "unload"):
+                base_model = engram_m.unload()
 
         speedup = full_ttft / engram_ttft
         tokens_saved = actual_tokens - bare_tokens
@@ -476,6 +537,7 @@ def run_benchmark() -> None:
             "target_len": c_len,
             "actual_tokens": actual_tokens,
             "kv_cache_mib": kv_mib,
+            "engram_kv_cache_mib": bare_kv_mib,
             "rust_compile_ms": c_ms,
             "full_ttft_ms": full_ttft,
             "engram_ttft_ms": engram_ttft,
@@ -483,12 +545,12 @@ def run_benchmark() -> None:
             "compression_pct": compression_pct,
         })
 
-    print("=" * 110)
-    print(f"{'CONTEXT LEN':<12} | {'KV CACHE (MiB)':<15} | {'RUST COMPILE':<14} | {'FULL TTFT':<12} | {'ENGRAM TTFT':<12} | {'SPEEDUP':<10} | {'PROMPT COMPR'}")
-    print("-" * 110)
+    print("=" * 125)
+    print(f"{'CONTEXT LEN':<12} | {'FULL KV (MiB)':<14} | {'ENGRAM KV (MiB)':<16} | {'RUST COMPILE':<14} | {'FULL TTFT':<12} | {'ENGRAM TTFT':<12} | {'SPEEDUP':<10} | {'PROMPT COMPR'}")
+    print("-" * 125)
     for s in scaling_data:
-        print(f"{s['actual_tokens']:<12} | {s['kv_cache_mib']:<15.2f} | {s['rust_compile_ms']:<12.1f} ms | {s['full_ttft_ms']:<10.2f} ms | {s['engram_ttft_ms']:<10.2f} ms | {s['speedup']:<8.1f}x | {s['compression_pct']:.1f}%")
-    print("=" * 110)
+        print(f"{s['actual_tokens']:<12} | {s['kv_cache_mib']:<14.2f} | {s['engram_kv_cache_mib']:<16.2f} | {s['rust_compile_ms']:<12.1f} ms | {s['full_ttft_ms']:<10.2f} ms | {s['engram_ttft_ms']:<10.2f} ms | {s['speedup']:<8.1f}x | {s['compression_pct']:.1f}%")
+    print("=" * 125)
 
     # =========================================================================
     # PART 3: ARCHITECTURE ABLATION (ATTENTION vs MLP vs DUAL)
@@ -505,13 +567,14 @@ def run_benchmark() -> None:
     eval_prompt = f"Question: {sample_needle['question']}\nAnswer:"
     eval_answer = f" {sample_needle['expected']}"
 
-    # Base without adapter perplexity
-    with (model.disable_adapter() if hasattr(model, "disable_adapter") else nullcontext()):
-        base_ppl = compute_target_perplexity(model, eval_prompt, eval_answer, tokenizer, device)
+    # Base without adapter perplexity on clean model
+    base_model = get_base_model(base_model)
+    base_ppl = compute_target_perplexity(base_model, eval_prompt, eval_answer, tokenizer, device)
 
     for label, targets in ablation_modes:
+        base_model = get_base_model(base_model)
         with tempfile.TemporaryDirectory() as a_dir:
-            c = EngramCompiler(model, tokenizer)
+            c = EngramCompiler(base_model, tokenizer)
             c.compile_text(
                 context_2k,
                 output_dir=a_dir,
@@ -523,7 +586,7 @@ def run_benchmark() -> None:
             c_time = c.last_compile_time_ms or 0.0
             adapter_size_kb = (Path(a_dir) / "adapter_model.safetensors").stat().st_size / 1024.0
 
-            ad_model = EngramCompiler.inject_engram(model, a_dir)
+            ad_model = EngramCompiler.inject_engram(base_model, a_dir)
             eng_ppl = compute_target_perplexity(ad_model, eval_prompt, eval_answer, tokenizer, device)
             ppl_drop = (base_ppl - eng_ppl) / base_ppl * 100.0
 
@@ -535,6 +598,9 @@ def run_benchmark() -> None:
                 "ppl": eng_ppl,
                 "ppl_drop": ppl_drop,
             })
+
+            if hasattr(ad_model, "unload"):
+                base_model = ad_model.unload()
 
     print("=" * 95)
     print(f"{'TARGET ARCHITECTURE':<32} | {'COMPILE (ms)':<14} | {'SIZE (KB)':<12} | {'PERPLEXITY':<12} | {'PPL DROP'}")
@@ -548,6 +614,12 @@ def run_benchmark() -> None:
     results_payload = {
         "device": str(device),
         "model": model_name,
+        "exact_recall_summary": {
+            "full_context": f"{full_success_count}/{len(TECHNICAL_DOMAINS)} ({full_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)",
+            "zero_context": f"{bare_success_count}/{len(TECHNICAL_DOMAINS)} ({bare_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)",
+            "engram_lora": f"{engram_success_count}/{len(TECHNICAL_DOMAINS)} ({engram_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)",
+            "virtual_prefix": f"{prefix_success_count}/{len(TECHNICAL_DOMAINS)} ({prefix_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)",
+        },
         "part1_multi_needle": comparison_results,
         "part2_scaling": scaling_data,
         "part3_ablation": ablation_results,

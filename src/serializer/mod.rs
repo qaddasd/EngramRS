@@ -4,7 +4,7 @@ pub mod safetensors;
 use std::path::Path;
 
 pub use peft_config::{module_sub_path, target_module_short_name, write_peft_config};
-pub use safetensors::{f32_bytes, write_safetensors};
+pub use safetensors::{f16_bytes, f32_bytes, write_safetensors, write_safetensors_typed};
 
 use crate::types::CompiledLayer;
 
@@ -14,6 +14,16 @@ pub fn write_adapter(
     layers: &[CompiledLayer],
     base_model_name_or_path: &str,
 ) -> Result<(), String> {
+    write_adapter_typed(output_dir, layers, base_model_name_or_path, false)
+}
+
+/// Write adapter with selectable float16 or float32 weight storage.
+pub fn write_adapter_typed(
+    output_dir: &Path,
+    layers: &[CompiledLayer],
+    base_model_name_or_path: &str,
+    use_f16: bool,
+) -> Result<(), String> {
     validate_layers(layers, base_model_name_or_path)?;
     std::fs::create_dir_all(output_dir).map_err(|error| {
         format!(
@@ -22,7 +32,7 @@ pub fn write_adapter(
         )
     })?;
 
-    write_safetensors(output_dir, layers)?;
+    write_safetensors_typed(output_dir, layers, use_f16)?;
     write_peft_config(output_dir, layers, base_model_name_or_path)?;
     Ok(())
 }

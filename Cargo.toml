@@ -3,17 +3,28 @@ name = "engram-rs"
 version = "0.3.0"
 edition = "2021"
 rust-version = "1.81"
+description = "Zero-Grad KV-to-LoRA Compiler in Rust + Python (Experimental Research Prototype)"
+license = "MIT"
+repository = "https://github.com/qaddasd/EngramRS"
+homepage = "https://github.com/qaddasd/EngramRS"
+readme = "README.md"
+keywords = ["llm", "lora", "transformers", "kv-cache", "rust"]
+categories = ["science", "mathematics"]
 
 [lib]
 name = "engram_rs"
 crate-type = ["cdylib", "rlib"]
+
+[features]
+default = ["extension-module"]
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 ahash = "0.8"
 faer = "0.19"
 half = "2.4"
 numpy = "0.22"
-pyo3 = { version = "0.22", features = ["extension-module"] }
+pyo3 = { version = "0.22" }
 rayon = "1.10"
 safetensors = "0.4"
 serde = { version = "1", features = ["derive"] }

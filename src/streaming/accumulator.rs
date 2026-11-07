@@ -152,7 +152,8 @@ impl FrequentDirectionsSketch {
                 self.buffer_x.write(i, c, shrunk * v.read(c, i));
             }
             for c in 0..self.d_out {
-                self.buffer_y.write(i, c, inv_gamma * (shrunk * v.read(self.d_in + c, i)));
+                self.buffer_y
+                    .write(i, c, inv_gamma * (shrunk * v.read(self.d_in + c, i)));
             }
         }
 

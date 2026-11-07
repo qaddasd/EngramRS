@@ -148,8 +148,8 @@ def cmd_export_gguf(args: argparse.Namespace) -> int:
     print(f"  • Output file: {out_file} ({size_mb:.2f} MB)")
     print(f"  • Target architecture: {args.architecture}")
     print(f"  • Format: GGML_{args.out_type.upper()}")
-    print(f"  • Usage: llama-cli -m model.gguf --lora {Path(out_file).name}")
-    print(f"           ollama run model --lora {Path(out_file).name}")
+    print(f"  • Usage (llama.cpp): llama-cli -m model.gguf --lora {Path(out_file).name} -p \"Your prompt\"")
+    print(f"  • Usage (Ollama):    Create Modelfile with 'FROM <base>\\nADAPTER {Path(out_file).name}', then 'ollama create my-model -f Modelfile'")
     return 0
 
 

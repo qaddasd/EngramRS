@@ -531,6 +531,33 @@ fn safetensors_and_peft_config_round_trip() {
 }
 
 #[test]
+fn safetensors_fp16_round_trip() {
+    use engram_rs::serializer::write_adapter_typed;
+    let layers = vec![CompiledLayer {
+        lora_a: vec![0.5, -1.0, 2.0, -3.5],
+        lora_b: vec![1.25, -0.75, 4.0, 0.0],
+        rank: 2,
+        d_model: 2,
+        target: "o_proj".to_string(),
+        layer_index: 0,
+        d_in: 2,
+        d_out: 2,
+    }];
+    let directory = temporary_directory("adapter-fp16-roundtrip");
+    write_adapter_typed(&directory, &layers, "test/base-model", true).unwrap();
+
+    let bytes = std::fs::read(directory.join("adapter_model.safetensors")).unwrap();
+    let tensors = SafeTensors::deserialize(&bytes).unwrap();
+    let a = tensors
+        .tensor("base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight")
+        .unwrap();
+    assert_eq!(a.dtype(), Dtype::F16);
+    assert_eq!(a.shape(), &[2, 2]);
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+#[test]
 fn serializer_rejects_inconsistent_layers() {
     let layers = vec![
         CompiledLayer {

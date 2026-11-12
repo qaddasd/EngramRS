@@ -128,18 +128,6 @@ pub fn hash_f32_slice(slice: &[f32]) -> u64 {
     hasher.finish()
 }
 
-/// Zero-allocation 64-bit hashing for a single matrix row without allocating a vector.
-#[inline(always)]
-pub fn hash_matrix_row(mat: &Mat<f32>, row: usize, cols: usize) -> u64 {
-    let mut hasher = AHasher::default();
-    for col in 0..cols {
-        let val = mat.read(row, col);
-        let bits = if val == 0.0 { 0u32 } else { val.to_bits() };
-        hasher.write_u32(bits);
-    }
-    hasher.finish()
-}
-
 /// Check if a matrix row is all zeros without any memory allocation.
 #[inline(always)]
 pub fn is_matrix_row_zero(mat: &Mat<f32>, row: usize, cols: usize) -> bool {

@@ -56,4 +56,4 @@ jobs:
         run: maturin develop --release
 
       - name: Run Pytest
-        run: pytest -v tests/
+        run: pytest -v tests/ -m "not e2e"

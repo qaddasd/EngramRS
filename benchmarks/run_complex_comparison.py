@@ -4,7 +4,7 @@ Compares:
 1. Standard In-Context Prompting (Traditional KV-cache, Full Context)
 2. Zero Context Baseline (Context erased, no Engram adapter)
 3. EngramRS LoRA Memory Injection (Context erased, LoRA adapter active)
-4. EngramRS Virtual KV-Prefix (Context compressed into 32 virtual prefix tokens)
+4. EngramRS Query-Aware KV-Prefix (Context erased into a per-question SnapKV prefix)
 5. Prefix Caching Reference (vLLM / SGLang concept: KV retained in VRAM)
 
 Evaluates:
@@ -34,6 +34,11 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 from engram_rs import EngramCompiler, EngramPrefixTuner
+from transformers.cache_utils import DynamicCache
+
+# Resident prefix budget for the residual-KV tier. ~12% of a 2k-token context;
+# large enough for SnapKV to retain fact-bearing tokens (see REDESIGN_V2 §2.4).
+PREFIX_LEN = 256
 
 
 def synchronize(device: torch.device) -> None:
@@ -83,19 +88,29 @@ def measure_ttft(
     measured_runs: int = 5,
 ) -> float:
     """Measure Time-To-First-Token prefill latency in ms via median of multiple synchronized runs."""
-    input_ids = inputs["input_ids"]
     synchronize(device)
-    with torch.no_grad():
-        for _ in range(warmup_runs):
-            _ = model(input_ids)
+
+    def run_once() -> None:
+        run_inputs = dict(inputs)
+        pkv = run_inputs.get("past_key_values")
+        if pkv is not None:
+            # Clone the cache so repeated runs do not accumulate generated tokens.
+            legacy = pkv.to_legacy_cache() if hasattr(pkv, "to_legacy_cache") else pkv
+            run_inputs["past_key_values"] = DynamicCache.from_legacy_cache(
+                tuple((k.clone(), v.clone()) for k, v in legacy)
+            )
+        with torch.no_grad():
+            model(**run_inputs)
+
+    for _ in range(warmup_runs):
+        run_once()
     synchronize(device)
 
     latencies: list[float] = []
     for _ in range(measured_runs):
         synchronize(device)
         t0 = time.perf_counter()
-        with torch.no_grad():
-            _ = model(input_ids)
+        run_once()
         synchronize(device)
         latencies.append((time.perf_counter() - t0) * 1000.0)
 
@@ -134,7 +149,7 @@ def generate_text(
     model: Any,
     inputs: dict[str, torch.Tensor],
     tokenizer: Any,
-    max_new_tokens: int = 24,
+    max_new_tokens: int = 64,
 ) -> tuple[str, float]:
     """Generate tokens and record total generation latency in ms."""
     device = inputs["input_ids"].device
@@ -274,7 +289,9 @@ def run_benchmark() -> None:
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
-    base_model = AutoModelForCausalLM.from_pretrained(model_name, dtype=dtype).to(device).eval()
+    base_model = AutoModelForCausalLM.from_pretrained(
+        model_name, dtype=dtype, attn_implementation="eager"
+    ).to(device).eval()
     base_model.generation_config.pad_token_id = tokenizer.pad_token_id
 
     # Warmup
@@ -334,20 +351,22 @@ def run_benchmark() -> None:
         adapter_mib = adapter_bytes / (1024 * 1024)
         print(f"Compilation finished in {compile_time_ms:.2f} ms! Adapter size: {adapter_mib:.3f} MiB\n")
 
-        # Inject adapter into a clean copy/wrapper
-        adapted_model = EngramCompiler.inject_engram(base_model, adapter_path)
-
-        # Prefix Tuner compilation
+        # Residual-KV tier: a SnapKV prefix tuner on the CLEAN base model
+        # (before LoRA injection) so the prefix reflects base activations.
+        # The prefix is compiled PER DOMAIN with the question as the SnapKV
+        # observation window (query-aware). A fixed query-agnostic prefix drops
+        # buried needles (verified 0/5); query-aware selection retains them.
         tuner = EngramPrefixTuner(
-            model=adapted_model,
+            model=base_model,
             tokenizer=tokenizer,
-            prefix_len=32,
-            method="spectral",
+            prefix_len=PREFIX_LEN,
             preserve_sinks=1,
         )
-        print("Compiling virtual KV-prefix with EngramPrefixTuner...")
-        prefix_cache = tuner.compile_prefix(context_text=context_2k)
-        print(f"Virtual prefix generated: 32 virtual tokens (compression ratio: {context_tokens / 32:.1f}x)\n")
+        print(f"Query-aware SnapKV prefix: {PREFIX_LEN} tokens/domain "
+              f"(compression ratio: {context_tokens / PREFIX_LEN:.1f}x)\n")
+
+        # Inject adapter into a clean copy/wrapper
+        adapted_model = EngramCompiler.inject_engram(base_model, adapter_path)
 
         # Evaluate across the 5 domains
         comparison_results = []
@@ -398,15 +417,36 @@ def run_benchmark() -> None:
 
             ppl_drop = (bare_ppl - engram_ppl) / bare_ppl * 100.0
 
-            # 4. Virtual Prefix (32 tokens)
+            # 4. Query-aware SnapKV prefix (context erased, base model).
+            # The question is the observation window, so fact-bearing tokens are
+            # retained. prepare_generate_inputs sets cache_position = arange(B, B+q)
+            # and a prefix-covering attention_mask; a fresh cloned cache avoids
+            # generate() mutating the prefix across repeated runs.
             with adapted_model.disable_adapter():
-                prefix_inputs = {
-                    "input_ids": bare_inputs["input_ids"],
-                    "past_key_values": prefix_cache,
-                    "use_cache": True,
-                }
-                prefix_ttft = measure_ttft(adapted_model, prefix_inputs, device)
-                prefix_gen, prefix_lat = generate_text(adapted_model, prefix_inputs, tokenizer)
+                domain_prefix = tuner.compile_prefix(
+                    context_text=context_2k,
+                    prefix_len=PREFIX_LEN,
+                    selection="snapkv",
+                    query_text=f"Question: {question}\nAnswer:",
+                )
+                prefix_legacy = tuple(
+                    (k.clone(), v.clone())
+                    for k, v in (domain_prefix[i] for i in range(len(domain_prefix)))
+                )
+                del domain_prefix
+
+                def fresh_prefix_inputs() -> dict:
+                    cache = DynamicCache.from_legacy_cache(
+                        tuple((k.clone(), v.clone()) for k, v in prefix_legacy)
+                    )
+                    return tuner.prepare_generate_inputs(
+                        bare_inputs["input_ids"],
+                        cache,
+                        attention_mask=bare_inputs.get("attention_mask"),
+                    )
+
+                prefix_ttft = measure_ttft(adapted_model, fresh_prefix_inputs(), device)
+                prefix_gen, prefix_lat = generate_text(adapted_model, fresh_prefix_inputs(), tokenizer)
                 prefix_success = expected.lower() in prefix_gen.lower()
                 if prefix_success:
                     prefix_success_count += 1
@@ -438,7 +478,7 @@ def run_benchmark() -> None:
                     "success": engram_success,
                 },
                 "prefix": {
-                    "tokens": 32 + bare_tokens,
+                    "tokens": PREFIX_LEN + bare_tokens,
                     "ttft_ms": prefix_ttft,
                     "gen": prefix_gen,
                     "success": prefix_success,
@@ -466,14 +506,14 @@ def run_benchmark() -> None:
     print(f"  • Full Context (KV {context_tokens}t) : {full_success_count} / {len(TECHNICAL_DOMAINS)} ({full_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
     print(f"  • Without Context (Base)   : {bare_success_count} / {len(TECHNICAL_DOMAINS)} ({bare_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
     print(f"  • With Engram (LoRA)       : {engram_success_count} / {len(TECHNICAL_DOMAINS)} ({engram_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
-    print(f"  • With Virtual Prefix (32t): {prefix_success_count} / {len(TECHNICAL_DOMAINS)} ({prefix_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
+    print(f"  • With Query-Aware Prefix ({PREFIX_LEN}t): {prefix_success_count} / {len(TECHNICAL_DOMAINS)} ({prefix_success_count/len(TECHNICAL_DOMAINS)*100:.1f}%)")
 
     print("\nSAMPLE GENERATIONS COMPARISON:")
     for r in comparison_results:
         print(f"\n[Domain: {r['domain']} | Expected: {r['expected']}]")
         print(f"  • Without Context (Base)   : {r['bare']['gen']!r}")
         print(f"  • With Engram (LoRA)       : {r['engram']['gen']!r}")
-        print(f"  • With Virtual Prefix (32t): {r['prefix']['gen']!r}")
+        print(f"  • With Query-Aware Prefix ({PREFIX_LEN}t): {r['prefix']['gen']!r}")
         print(f"  • Full Context (KV 2000t)  : {r['full']['gen']!r}")
 
     # =========================================================================

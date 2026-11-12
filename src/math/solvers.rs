@@ -4,6 +4,29 @@ use faer::{Mat, Side};
 use crate::math::factorize::{factorize_reduced_weights, factorize_weights};
 use crate::types::{matrix_is_finite, AnchoredMatrices, CompiledLayer, LayerCompilerConfig};
 
+/// Effective ridge regularization from a *relative* epsilon.
+///
+/// `lambda_reg` is no longer an absolute ridge value: it is a relative epsilon
+/// scaled by the mean diagonal energy of the (null-penalized) normal matrix,
+/// `lambda_eff = lambda_reg * trace(gram) / d_in`. An absolute 1e-4 ridge is
+/// numerically negligible for LLM activations (||x||^2 ~ 1e3..1e6); the
+/// relative form keeps the regularization meaningful at any activation scale
+/// and makes the solution invariant to uniform rescaling of (X, Y).
+///
+/// `trace` must be the trace of the normal matrix AFTER the null-space penalty
+/// has been added. For the dual path, trace(Z Z^T) = trace(Z^T Z) = ||Z||_F^2,
+/// so passing the dual gram trace with `d_in = X.ncols()` keeps primal and dual
+/// numerically equivalent.
+fn effective_lambda(lambda_reg: f32, trace: f64, d_in: usize) -> f32 {
+    if trace > 0.0 && trace.is_finite() {
+        (f64::from(lambda_reg) * trace / d_in as f64) as f32
+    } else {
+        // Degenerate (all-zero) normal matrix: fall back to the absolute
+        // epsilon so the regularized system stays positive definite.
+        lambda_reg
+    }
+}
+
 pub fn solve_primal_and_factorize(
     anchored: &AnchoredMatrices,
     null_states: Option<&[f32]>,
@@ -30,11 +53,15 @@ pub fn solve_primal_and_factorize(
             }
         }
     }
+    // Relative ridge: lambda_eff = lambda_reg * trace(gram) / d_in, computed
+    // AFTER the null-space penalty and BEFORE adding lambda_eff * I.
+    let trace: f64 = (0..d_in).map(|i| f64::from(gram.read(i, i))).sum();
+    let lambda_eff = effective_lambda(config.lambda_reg, trace, d_in);
     for diagonal in 0..d_in {
         gram.write(
             diagonal,
             diagonal,
-            gram.read(diagonal, diagonal) + config.lambda_reg,
+            gram.read(diagonal, diagonal) + lambda_eff,
         );
     }
     if !matrix_is_finite(gram.as_ref()) || !matrix_is_finite(cross.as_ref()) {
@@ -89,11 +116,17 @@ pub fn solve_dual_and_factorize(
         },
     );
     let mut gram = z.as_ref() * z.transpose();
+    // Same relative ridge definition as the primal path: trace(Z Z^T) equals
+    // trace(Z^T Z) = ||Z||_F^2 (including the sqrt(lambda_null)-scaled null
+    // rows), normalized by d_in = X.ncols() (NOT p) so primal and dual remain
+    // numerically equivalent.
+    let trace: f64 = (0..p).map(|i| f64::from(gram.read(i, i))).sum();
+    let lambda_eff = effective_lambda(config.lambda_reg, trace, d_in);
     for diagonal in 0..p {
         gram.write(
             diagonal,
             diagonal,
-            gram.read(diagonal, diagonal) + config.lambda_reg,
+            gram.read(diagonal, diagonal) + lambda_eff,
         );
     }
     if !matrix_is_finite(gram.as_ref()) || !matrix_is_finite(rhs.as_ref()) {

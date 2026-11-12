@@ -1,8 +1,12 @@
 use faer::linalg::solvers::{Cholesky, Qr, SpSolver};
-use faer::{Mat, Side};
+use faer::{Mat, MatRef, Side};
 
 use crate::math::factorize::{factorize_reduced_weights, factorize_weights};
 use crate::types::{matrix_is_finite, CompiledLayer, LayerCompilerConfig};
+
+fn f64_matrix_is_finite(matrix: MatRef<'_, f64>) -> bool {
+    (0..matrix.nrows()).all(|row| (0..matrix.ncols()).all(|col| matrix.read(row, col).is_finite()))
+}
 
 /// Frequent Directions (FD) matrix sketch for wide layers (d_in > 4096 or FFN/MLP).
 ///
@@ -20,6 +24,11 @@ pub struct FrequentDirectionsSketch {
     pub d_in: usize,
     pub d_out: usize,
     pub total_tokens: usize,
+    /// Joint X/Y balance factor, computed ONCE at the first compression and
+    /// reused for every subsequent compression. Recomputing it per buffer
+    /// would rescale previously shrunk rows under a new gamma and break the
+    /// FD spectral bound.
+    pub gamma: Option<f32>,
 }
 
 impl FrequentDirectionsSketch {
@@ -33,6 +42,7 @@ impl FrequentDirectionsSketch {
             d_in,
             d_out,
             total_tokens: 0,
+            gamma: None,
         }
     }
 
@@ -41,7 +51,10 @@ impl FrequentDirectionsSketch {
         if nrows == 0 {
             return Ok(());
         }
-        if x.len() != nrows * self.d_in {
+        let expected_x_len = nrows.checked_mul(self.d_in).ok_or_else(|| {
+            "x chunk dimensions (nrows * d_in) overflow addressable memory".to_string()
+        })?;
+        if x.len() != expected_x_len {
             return Err(format!(
                 "x chunk length ({}) does not match nrows * d_in ({} * {})",
                 x.len(),
@@ -49,7 +62,10 @@ impl FrequentDirectionsSketch {
                 self.d_in
             ));
         }
-        if y.len() != nrows * self.d_out {
+        let expected_y_len = nrows.checked_mul(self.d_out).ok_or_else(|| {
+            "y chunk dimensions (nrows * d_out) overflow addressable memory".to_string()
+        })?;
+        if y.len() != expected_y_len {
             return Err(format!(
                 "y chunk length ({}) does not match nrows * d_out ({} * {})",
                 y.len(),
@@ -83,6 +99,11 @@ impl FrequentDirectionsSketch {
     ///
     /// Balances Frobenius norms between X and Y to avoid asymmetric eigenvalue masking,
     /// shrinks singular values by \delta = \sigma_m^2, and retains exact joint spectral bounds.
+    ///
+    /// \gamma is computed ONCE (at the first compression, from the first buffer
+    /// contents) and reused for all subsequent compressions: previously shrunk
+    /// rows were compressed under that gamma, so recomputing it per buffer
+    /// would break the spectral bound.
     pub fn compress(&mut self) -> Result<(), String> {
         if self.current_rows <= self.m {
             return Ok(());
@@ -91,26 +112,42 @@ impl FrequentDirectionsSketch {
         let n = self.current_rows;
         let d_total = self.d_in + self.d_out;
 
-        // Compute Frobenius norms to determine balance multiplier \gamma
-        let mut norm_x_sq = 0.0f64;
-        for r in 0..n {
-            for c in 0..self.d_in {
-                let v = self.buffer_x.read(r, c) as f64;
-                norm_x_sq += v * v;
-            }
-        }
-        let mut norm_y_sq = 0.0f64;
-        for r in 0..n {
-            for c in 0..self.d_out {
-                let v = self.buffer_y.read(r, c) as f64;
-                norm_y_sq += v * v;
-            }
-        }
+        let gamma = match self.gamma {
+            Some(fixed) => fixed,
+            None => {
+                // Compute Frobenius norms of the FIRST compressed buffer to
+                // determine the balance multiplier \gamma.
+                let mut norm_x_sq = 0.0f64;
+                for r in 0..n {
+                    for c in 0..self.d_in {
+                        let v = self.buffer_x.read(r, c) as f64;
+                        norm_x_sq += v * v;
+                    }
+                }
+                let mut norm_y_sq = 0.0f64;
+                for r in 0..n {
+                    for c in 0..self.d_out {
+                        let v = self.buffer_y.read(r, c) as f64;
+                        norm_y_sq += v * v;
+                    }
+                }
 
-        let gamma = if norm_y_sq > 1e-12 {
-            ((norm_x_sq / self.d_in as f64) / (norm_y_sq / self.d_out as f64 + 1e-12)).sqrt() as f32
-        } else {
-            1.0f32
+                let raw_gamma = if norm_y_sq > 1e-12 {
+                    ((norm_x_sq / self.d_in as f64) / (norm_y_sq / self.d_out as f64 + 1e-12))
+                        .sqrt() as f32
+                } else {
+                    1.0f32
+                };
+                if !raw_gamma.is_finite() {
+                    return Err(
+                        "Frequent Directions balance factor gamma is non-finite; input buffer contains non-finite values"
+                            .to_string(),
+                    );
+                }
+                let fixed = raw_gamma.clamp(1e-6, 1e6);
+                self.gamma = Some(fixed);
+                fixed
+            }
         };
 
         // Form joint matrix Z = [X | \gamma Y] of shape [n, d_in + d_out]
@@ -121,6 +158,14 @@ impl FrequentDirectionsSketch {
                 gamma * self.buffer_y.read(r, c - self.d_in)
             }
         });
+
+        // Never silently poison the sketch with NaN/Inf: refuse to compress.
+        if !matrix_is_finite(joint_z.as_ref()) {
+            return Err(
+                "Frequent Directions joint buffer contains non-finite values; refusing to compress"
+                    .to_string(),
+            );
+        }
 
         // Thin SVD of joint Z: Z = U * \Sigma * V^T
         let svd_z = joint_z.thin_svd();
@@ -315,7 +360,10 @@ impl CovarianceAccumulator {
             return Ok(());
         }
 
-        if x.len() != nrows * self.d_in {
+        let expected_x_len = nrows.checked_mul(self.d_in).ok_or_else(|| {
+            "x chunk dimensions (nrows * d_in) overflow addressable memory".to_string()
+        })?;
+        if x.len() != expected_x_len {
             return Err(format!(
                 "x chunk length ({}) does not match nrows * d_in ({} * {})",
                 x.len(),
@@ -323,7 +371,10 @@ impl CovarianceAccumulator {
                 self.d_in
             ));
         }
-        if y.len() != nrows * self.d_out {
+        let expected_y_len = nrows.checked_mul(self.d_out).ok_or_else(|| {
+            "y chunk dimensions (nrows * d_out) overflow addressable memory".to_string()
+        })?;
+        if y.len() != expected_y_len {
             return Err(format!(
                 "y chunk length ({}) does not match nrows * d_out ({} * {})",
                 y.len(),
@@ -381,33 +432,38 @@ impl CovarianceAccumulator {
             ));
         }
 
-        let gram_f32 = Mat::from_fn(self.d_in, self.d_in, |row, col| {
-            let val = self.c.read(row, col) as f32;
-            if row == col {
-                val + config.lambda_reg
-            } else {
-                val
-            }
-        });
-        let cross_f32 = Mat::from_fn(self.d_in, self.d_out, |row, col| {
-            self.p.read(row, col) as f32
-        });
+        // Solve entirely in f64: the accumulators are f64, so casting the gram
+        // and cross matrices to f32 before Cholesky would throw away the
+        // accumulated precision on ill-conditioned data. Only the final weight
+        // matrix is cast to f32 for the LoRA factorization.
+        let mut gram = self.c.clone();
+        for diagonal in 0..self.d_in {
+            gram.write(
+                diagonal,
+                diagonal,
+                gram.read(diagonal, diagonal) + f64::from(config.lambda_reg),
+            );
+        }
+        let cross = self.p.clone();
 
-        if !matrix_is_finite(gram_f32.as_ref()) || !matrix_is_finite(cross_f32.as_ref()) {
+        if !f64_matrix_is_finite(gram.as_ref()) || !f64_matrix_is_finite(cross.as_ref()) {
             return Err("streaming accumulated covariance contains non-finite values".to_string());
         }
 
-        let cholesky = Cholesky::try_new(gram_f32.as_ref(), Side::Lower).map_err(|error| {
+        let cholesky = Cholesky::try_new(gram.as_ref(), Side::Lower).map_err(|error| {
             format!(
                 "Cholesky factorization failed on streaming normal matrix: {error:?}; \
                  increase lambda_reg or stream more diverse tokens"
             )
         })?;
 
-        let weights = cholesky.solve(cross_f32.as_ref());
-        if !matrix_is_finite(weights.as_ref()) {
+        let weights_f64 = cholesky.solve(cross.as_ref());
+        if !f64_matrix_is_finite(weights_f64.as_ref()) {
             return Err("streaming Cholesky solution contains non-finite values".to_string());
         }
+        let weights = Mat::from_fn(self.d_in, self.d_out, |row, col| {
+            weights_f64.read(row, col) as f32
+        });
 
         factorize_weights(&weights, config, target, layer_index)
     }
@@ -495,5 +551,220 @@ mod tests {
         let layer = acc.solve(&cfg, "down_proj", 0).unwrap();
         assert_eq!(layer.d_in, 8192);
         assert_eq!(layer.d_out, 1024);
+    }
+
+    fn spectral_norm(matrix: faer::MatRef<'_, f32>) -> f64 {
+        let svd = matrix.thin_svd();
+        let s = svd.s_diagonal();
+        if s.nrows() == 0 {
+            0.0
+        } else {
+            f64::from(s.read(0))
+        }
+    }
+
+    /// R3(a): 10 chunks of 2m rows (many compressions) must approximate the
+    /// dense X^T X and X^T Y within the FD spectral bound ||Z||_F^2 / m.
+    #[test]
+    fn test_fd_multi_compression_respects_spectral_bound() {
+        let d_in = 24;
+        let d_out = 8;
+        let m = 16;
+        let chunk_rows = 2 * m;
+        let chunks = 10;
+        let n = chunk_rows * chunks;
+        let x: Vec<f32> = (0..n * d_in)
+            .map(|i| ((i * 7 + 3) as f32).sin() * 2.0)
+            .collect();
+        let y: Vec<f32> = (0..n * d_out)
+            .map(|i| ((i * 5 + 1) as f32).cos() * 0.7)
+            .collect();
+
+        let mut sketch = FrequentDirectionsSketch::new(d_in, d_out, m);
+        for c in 0..chunks {
+            sketch
+                .add_chunk(
+                    &x[c * chunk_rows * d_in..(c + 1) * chunk_rows * d_in],
+                    &y[c * chunk_rows * d_out..(c + 1) * chunk_rows * d_out],
+                    chunk_rows,
+                )
+                .unwrap();
+        }
+        assert_eq!(sketch.total_tokens, n);
+        let gamma = sketch
+            .gamma
+            .expect("gamma must be fixed after compressions");
+        let k = sketch.current_rows;
+        assert!(k <= m);
+
+        let bx = sketch.buffer_x.submatrix(0, 0, k, d_in);
+        let by = sketch.buffer_y.submatrix(0, 0, k, d_out);
+        let sketch_gram = Mat::from_fn(d_in, d_in, |i, j| {
+            let mut s = 0.0f64;
+            for r in 0..k {
+                s += f64::from(bx.read(r, i)) * f64::from(bx.read(r, j));
+            }
+            s
+        });
+        let sketch_cross = Mat::from_fn(d_in, d_out, |i, j| {
+            let mut s = 0.0f64;
+            for r in 0..k {
+                s += f64::from(bx.read(r, i)) * f64::from(by.read(r, j));
+            }
+            s
+        });
+        let dense_gram = Mat::from_fn(d_in, d_in, |i, j| {
+            let mut s = 0.0f64;
+            for r in 0..n {
+                s += f64::from(x[r * d_in + i]) * f64::from(x[r * d_in + j]);
+            }
+            s
+        });
+        let dense_cross = Mat::from_fn(d_in, d_out, |i, j| {
+            let mut s = 0.0f64;
+            for r in 0..n {
+                s += f64::from(x[r * d_in + i]) * f64::from(y[r * d_out + j]);
+            }
+            s
+        });
+        let diff_gram = Mat::from_fn(d_in, d_in, |i, j| {
+            (dense_gram.read(i, j) - sketch_gram.read(i, j)) as f32
+        });
+        let diff_cross = Mat::from_fn(d_in, d_out, |i, j| {
+            (dense_cross.read(i, j) - sketch_cross.read(i, j)) as f32
+        });
+
+        let norm_x_sq: f64 = x.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        let norm_y_sq: f64 = y.iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+        let gamma_f64 = f64::from(gamma);
+        let bound = (norm_x_sq + gamma_f64 * gamma_f64 * norm_y_sq) / m as f64;
+
+        let gram_err = spectral_norm(diff_gram.as_ref());
+        // The joint off-diagonal block is gamma * X^T Y, so scale its error.
+        let cross_err = gamma_f64 * spectral_norm(diff_cross.as_ref());
+        assert!(
+            gram_err <= bound * 1.02 + 1e-3,
+            "FD gram error {gram_err} exceeds bound {bound}"
+        );
+        assert!(
+            cross_err <= bound * 1.02 + 1e-3,
+            "FD cross error {cross_err} exceeds bound {bound}"
+        );
+    }
+
+    /// R3(b): gamma is computed once and stays constant across compressions,
+    /// even when later chunks have very different X/Y norm ratios.
+    #[test]
+    fn test_fd_gamma_fixed_across_compressions() {
+        let d_in = 12;
+        let d_out = 4;
+        let m = 16;
+        let mut sketch = FrequentDirectionsSketch::new(d_in, d_out, m);
+        assert!(sketch.gamma.is_none());
+        let mut recorded = Vec::new();
+        for c in 0..8 {
+            let scale = 1.0 + 3.0 * (c % 4) as f32;
+            let rows = 2 * m;
+            let x: Vec<f32> = (0..rows * d_in)
+                .map(|i| ((i * 11 + c * 7 + 1) as f32).sin() * scale)
+                .collect();
+            let y: Vec<f32> = (0..rows * d_out)
+                .map(|i| ((i * 3 + c * 5 + 2) as f32).cos() * 0.1 * scale)
+                .collect();
+            sketch.add_chunk(&x, &y, rows).unwrap();
+            recorded.push(sketch.gamma.unwrap());
+        }
+        let first = recorded[0];
+        assert!(
+            recorded.iter().all(|&g| g == first),
+            "gamma drifted across compressions: {recorded:?}"
+        );
+        assert!((1e-6..=1e6).contains(&first));
+    }
+
+    /// R3(c): a near-zero Y chunk must select gamma = 1.0 and never produce NaN.
+    #[test]
+    fn test_fd_near_zero_y_chunk_does_not_produce_nan() {
+        let d_in = 8;
+        let d_out = 4;
+        let m = 16;
+        let mut sketch = FrequentDirectionsSketch::new(d_in, d_out, m);
+        let rows = 2 * m;
+        let x: Vec<f32> = (0..rows * d_in)
+            .map(|i| ((i * 7 + 1) as f32).sin())
+            .collect();
+        let y_zero = vec![0.0f32; rows * d_out];
+        sketch.add_chunk(&x, &y_zero, rows).unwrap();
+        assert_eq!(sketch.gamma, Some(1.0));
+
+        for c in 0..3 {
+            let y: Vec<f32> = (0..rows * d_out)
+                .map(|i| ((i * 5 + c * 3 + 2) as f32).cos() * 0.5)
+                .collect();
+            sketch.add_chunk(&x, &y, rows).unwrap();
+        }
+        let cfg = LayerCompilerConfig::new(4, 32, 1e-3, 0.0);
+        let layer = sketch.solve(&cfg, "down_proj", 0).unwrap();
+        assert!(layer
+            .lora_a
+            .iter()
+            .chain(&layer.lora_b)
+            .all(|v| v.is_finite()));
+    }
+
+    /// R3: non-finite buffer contents must return Err, never poison the sketch.
+    #[test]
+    fn test_fd_non_finite_buffer_returns_error() {
+        let d_in = 8;
+        let d_out = 4;
+        let m = 16;
+        let rows = 2 * m;
+        let clean_x: Vec<f32> = (0..rows * d_in)
+            .map(|i| ((i * 7 + 1) as f32).sin())
+            .collect();
+        let y = vec![0.5f32; rows * d_out];
+
+        // NaN on the very first compression (gamma not yet fixed).
+        let mut sketch = FrequentDirectionsSketch::new(d_in, d_out, m);
+        let mut bad_x = clean_x.clone();
+        bad_x[5] = f32::NAN;
+        let err = sketch.add_chunk(&bad_x, &y, rows).unwrap_err();
+        assert!(err.contains("non-finite"), "{err}");
+
+        // Inf arriving after gamma was fixed: the joint-buffer guard must fire.
+        let mut sketch2 = FrequentDirectionsSketch::new(d_in, d_out, m);
+        sketch2.add_chunk(&clean_x, &y, rows).unwrap();
+        let mut bad_y = y.clone();
+        bad_y[3] = f32::INFINITY;
+        let err2 = sketch2.add_chunk(&clean_x, &bad_y, rows).unwrap_err();
+        assert!(err2.contains("non-finite"), "{err2}");
+    }
+
+    /// R3: gamma is clamped to [1e-6, 1e6] for extreme norm asymmetry.
+    #[test]
+    fn test_fd_gamma_clamped_to_range() {
+        let d_in = 8;
+        let d_out = 4;
+        let m = 16;
+        let mut sketch = FrequentDirectionsSketch::new(d_in, d_out, m);
+        let rows = 2 * m;
+        let x = vec![1e9f32; rows * d_in];
+        // ||Y||_F^2 must stay above the 1e-12 near-zero guard while the
+        // X/Y norm ratio still forces gamma far above the 1e6 clamp.
+        let y = vec![1e-5f32; rows * d_out];
+        sketch.add_chunk(&x, &y, rows).unwrap();
+        assert_eq!(sketch.gamma, Some(1e6));
+    }
+
+    /// R8: size computations must use checked_mul and return Err on overflow.
+    #[test]
+    fn test_add_chunk_size_overflow_returns_error() {
+        let mut dense = CovarianceAccumulator::new(4, 4);
+        let err = dense.add_chunk(&[], &[], usize::MAX).unwrap_err();
+        assert!(err.contains("overflow"), "{err}");
+
+        let mut sketch = FrequentDirectionsSketch::new(4, 4, 16);
+        let err = sketch.add_chunk(&[], &[], usize::MAX).unwrap_err();
+        assert!(err.contains("overflow"), "{err}");
     }
 }

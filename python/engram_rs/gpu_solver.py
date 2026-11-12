@@ -14,6 +14,19 @@ import torch
 from torch import nn
 
 
+def _effective_lambda(lambda_reg: float, trace: torch.Tensor, d_in: int) -> float:
+    """Relative ridge matching the Rust core (src/math/solvers.rs).
+
+    lambda_eff = lambda_reg * trace(gram) / d_in, computed AFTER the null-space
+    penalty. Keeps regularization meaningful at any activation scale and makes
+    the GPU path numerically equivalent to the Rust primal/dual solvers.
+    """
+    trace_val = float(trace)
+    if trace_val > 0.0 and math.isfinite(trace_val):
+        return lambda_reg * trace_val / d_in
+    return lambda_reg
+
+
 def _validate_tensor_inputs(
     hidden_states: torch.Tensor,
     target_outputs: torch.Tensor,
@@ -182,9 +195,12 @@ def solve_layer_gpu(
             z = x
             rhs = y
 
-        # Dual Gram matrix: K = Z Z^T + lambda_reg * I_p  (shape p x p)
+        # Dual Gram matrix: K = Z Z^T + lambda_eff * I_p  (shape p x p).
+        # Relative ridge normalized by d_in (= d), NOT p, to match the Rust core.
         eye_p = torch.eye(p, device=target_device, dtype=solve_dtype)
-        k_mat = z @ z.transpose(0, 1) + lambda_reg * eye_p
+        k_mat = z @ z.transpose(0, 1)
+        lambda_eff = _effective_lambda(lambda_reg, k_mat.diagonal().sum(), d)
+        k_mat = k_mat + lambda_eff * eye_p
 
         try:
             chol = torch.linalg.cholesky(k_mat)
@@ -209,11 +225,13 @@ def solve_layer_gpu(
         u = q @ u_m  # shape (d, p)
         v = vh.transpose(0, 1)  # shape (d, p)
     else:
-        # Primal formulation: (X^T X + lambda_null X_null^T X_null + lambda_reg I) W = X^T Y
+        # Primal: (X^T X + lambda_null X_null^T X_null + lambda_eff I) W = X^T Y.
+        # Relative ridge computed AFTER the null penalty, matching the Rust core.
         gram = x.transpose(0, 1) @ x
         if null_n > 0 and x_null is not None:
             gram = gram + lambda_null * (x_null.transpose(0, 1) @ x_null)
-        gram = gram + lambda_reg * eye_d
+        lambda_eff = _effective_lambda(lambda_reg, gram.diagonal().sum(), d)
+        gram = gram + lambda_eff * eye_d
         cross = x.transpose(0, 1) @ y
 
         try:

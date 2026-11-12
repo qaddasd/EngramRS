@@ -1,6 +1,13 @@
 """EngramRS activation capture, streaming covariance compilation, null-space projection, and ecosystem tools."""
 
-from .prefix import EngramPrefixTuner, spectral_compress_kv
+from .prefix import (
+    EngramPrefixTuner,
+    rope_apply_kv,
+    rope_inverse_kv,
+    select_compress_kv,
+    snapkv_importance,
+    spectral_compress_kv,
+)
 from .gpu_solver import (
     GPULayerCompiler,
     build_peft_state_dict,
@@ -66,7 +73,11 @@ __all__ = [
     "project_lora_to_null_space",
     "project_to_null_space",
     "randomized_svd",
+    "rope_apply_kv",
+    "rope_inverse_kv",
     "run_niah_benchmark",
+    "select_compress_kv",
+    "snapkv_importance",
     "solve_all_layers_gpu",
     "solve_layer_gpu",
     "spectral_compress_kv",

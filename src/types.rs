@@ -117,12 +117,6 @@ pub fn validate_target(
         return Err("rank must be greater than zero".to_string());
     }
     let max_dim = target.d_in.min(target.d_out);
-    if config.energy_threshold.is_none() && config.rank > max_dim {
-        return Err(format!(
-            "rank ({}) cannot exceed min(d_in, d_out) ({max_dim})",
-            config.rank
-        ));
-    }
     if config.rank > max_dim {
         return Err(format!(
             "rank ({}) cannot exceed min(d_in, d_out) ({max_dim})",

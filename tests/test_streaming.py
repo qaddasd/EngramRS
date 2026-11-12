@@ -229,3 +229,50 @@ def test_streaming_end_to_end_with_model(tmp_path: Path):
     # Test loading with inject_engram
     peft_model = EngramCompiler.inject_engram(model, str(adapter_path))
     assert peft_model is not None
+
+
+def test_streaming_accumulate_uses_continuous_kv_cache():
+    """Regression for independent-chunk forwards: chunked accumulation must match a
+    continuous-KV-cache reference (cross-chunk attention + continuous RoPE positions).
+    The old use_cache=False per-chunk path produced different activations and failed."""
+    from transformers import DynamicCache
+    from engram_rs.hooks import EngramContextCatcher
+
+    torch.manual_seed(0)
+    model = tiny_model().eval()
+    ids = torch.randint(2, 256, (1, 96))
+    layers = [0, 1]
+    chunk = 32
+
+    # Reference: thread one KV cache across chunks, capture per chunk.
+    ref = StreamingCovarianceAccumulator(layer_indices=layers)
+    cache = DynamicCache()
+    with torch.no_grad():
+        for s in range(0, ids.shape[1], chunk):
+            e = min(s + chunk, ids.shape[1])
+            with EngramContextCatcher(model, layer_indices=layers) as c:
+                model(
+                    input_ids=ids[:, s:e],
+                    past_key_values=cache,
+                    attention_mask=torch.ones(1, e, dtype=torch.long),
+                    cache_position=torch.arange(s, e),
+                    use_cache=True,
+                )
+            h, a = c.get_activations()
+            for li, x, y in zip(c.layer_indices, h, a):
+                ref.add_chunk(li, x, y)
+
+    acc = StreamingCovarianceAccumulator(layer_indices=layers)
+    acc.accumulate_from_model(
+        model,
+        tokenizer=None,
+        text_or_tokens=ids,
+        chunk_size=chunk,
+        device="cpu",
+        layer_indices=layers,
+    )
+
+    assert acc.total_tokens == ids.shape[1]
+    for li in layers:
+        np.testing.assert_allclose(acc._c[li], ref._c[li], rtol=1e-3, atol=1e-4)
+        np.testing.assert_allclose(acc._p[li], ref._p[li], rtol=1e-3, atol=1e-4)

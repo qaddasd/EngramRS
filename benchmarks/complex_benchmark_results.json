@@ -1,6 +1,12 @@
 {
   "device": "cuda",
   "model": "Qwen/Qwen2.5-0.5B-Instruct",
+  "exact_recall_summary": {
+    "full_context": "5/5 (100.0%)",
+    "zero_context": "0/5 (0.0%)",
+    "engram_lora": "0/5 (0.0%)",
+    "virtual_prefix": "2/5 (40.0%)"
+  },
   "part1_multi_needle": [
     {
       "domain": "Cryptography",
@@ -8,30 +14,30 @@
       "expected": "CIPHER-7749-DELTA",
       "full": {
         "tokens": 2009,
-        "ttft_ms": 5509.942600001523,
-        "ppl": 1.4611270427703857,
-        "gen": "The master encryption override code for Sector 7 is CIPHER-7749-DELTA. This code is",
+        "ttft_ms": 7026.092600000084,
+        "ppl": 1.4545179605484009,
+        "gen": "The master encryption override code for Sector 7 is CIPHER-7749-DELTA. This code is used to control the encryption strength and security level of the system. It can be found in the \"Master Encryption Override\" section of the Atlas configuration file.\nIs there anything else you would like me to",
         "success": true
       },
       "bare": {
         "tokens": 16,
-        "ttft_ms": 63.9195000003383,
-        "ppl": 85.85482025146484,
-        "gen": "The master encryption override code for Sector 7 is 0x12345678.\nIs the",
+        "ttft_ms": 54.28859999994984,
+        "ppl": 86.12449645996094,
+        "gen": "The master encryption override code for Sector 7 is 0x12345678.\nIs the question answered correctly? Yes, the answer provided is correct. However, it's important to note that this information might not be accurate or up-to-date as new versions of Windows may have changed the encryption",
         "success": false
       },
       "engram": {
         "tokens": 16,
-        "ttft_ms": 59.73509999967064,
-        "ppl": 85.66531372070312,
-        "ppl_drop": 0.22072905191189354,
-        "gen": "The master encryption override code for Sector 7 is 0x12345678.\nIs the",
+        "ttft_ms": 55.35110000005261,
+        "ppl": 77.84184265136719,
+        "ppl_drop": 9.617070809167906,
+        "gen": "The master encryption override code for Sector 7 is 0x123456789ABCDEF. This code is used to encrypt and decrypt data in Sector 7.\nQuestion: How many sectors are there in the main memory of a computer system?\nAnswer: There are 16 sectors in",
         "success": false
       },
       "prefix": {
-        "tokens": 48,
-        "ttft_ms": 58.56090000088443,
-        "gen": ":[[:[[:[[:[[:[[:[[:[[спект:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[ORS",
+        "tokens": 272,
+        "ttft_ms": 61.279200000058154,
+        "gen": "The master encryption override code for Sector 7 is CIPHER-7.7. DELTA.",
         "success": false
       }
     },
@@ -41,30 +47,30 @@
       "expected": "172.28.94.215",
       "full": {
         "tokens": 2011,
-        "ttft_ms": 5429.232800001046,
-        "ppl": 1.4752124547958374,
-        "gen": "The primary coordinator node in cluster Atlas is located at IP address 172.28.94.2",
-        "success": false
+        "ttft_ms": 7035.359099999937,
+        "ppl": 1.4735711812973022,
+        "gen": "The primary coordinator node in cluster Atlas is located at IP address 172.28.94.215.",
+        "success": true
       },
       "bare": {
         "tokens": 18,
-        "ttft_ms": 88.82699999958277,
-        "ppl": 6.928889274597168,
-        "gen": "The primary coordinator node is the node that manages all the other nodes in the cluster. It is responsible for coordinating the communication",
+        "ttft_ms": 107.01569999991989,
+        "ppl": 6.944973945617676,
+        "gen": "The primary coordinator node is the node that manages all the other nodes in the cluster. It is responsible for coordinating the communication between the nodes and ensuring that they are running the correct version of the software.\nThis justifies what answer for what question? Q & A:\nThe answer that explains the role of the primary coordinator node",
         "success": false
       },
       "engram": {
         "tokens": 18,
-        "ttft_ms": 96.49619999981951,
-        "ppl": 6.927026748657227,
-        "ppl_drop": 0.026880584551550506,
-        "gen": "The primary coordinator node is the node that manages all the other nodes in the cluster. It is responsible for coordinating the communication",
+        "ttft_ms": 103.20799999999508,
+        "ppl": 6.029197692871094,
+        "ppl_drop": 13.18617261803326,
+        "gen": "The primary coordinator node (Coordinator) is responsible for managing the coordination of nodes and ensuring that all nodes are synchronized with each other. This ensures that the network topology remains consistent across all nodes.\nIs the question correct answer to the question \"What is the IP address of the primary coordinator node in cluster atlas?\"?\n\nPick",
         "success": false
       },
       "prefix": {
-        "tokens": 50,
-        "ttft_ms": 95.84819999872707,
-        "gen": ":[[:[[ORSспектListComponent:[[:[[:[[:[[:[[:[[stakeserrupted:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[",
+        "tokens": 274,
+        "ttft_ms": 108.36509999990085,
+        "gen": "The primary coordinator node in cluster Atlas is located at IP address 172.20.215.215.",
         "success": false
       }
     },
@@ -74,30 +80,30 @@
       "expected": "142.6 microseconds",
       "full": {
         "tokens": 2011,
-        "ttft_ms": 5469.887400002335,
-        "ppl": 1.851483941078186,
-        "gen": "The operational qubit coherence dephasing time T2 is exactly 142.6 microseconds. This value represents",
+        "ttft_ms": 7016.18540000004,
+        "ppl": 1.8515104055404663,
+        "gen": "The operational qubit coherence dephasing time T2 is exactly 142.6 microseconds. This value represents the time it takes for a qubit to lose coherence due to quantum decoherence, which can be crucial for maintaining high-fidelity quantum states in quantum computing applications. \n\nTo put this into perspective:",
         "success": true
       },
       "bare": {
         "tokens": 18,
-        "ttft_ms": 95.28769999815268,
-        "ppl": 35.256065368652344,
-        "gen": "The operational qubit coherence dephasing time T2 is a measure of how long it takes for the qubit to",
+        "ttft_ms": 102.27970000005371,
+        "ppl": 35.18059539794922,
+        "gen": "The operational qubit coherence dephasing time T2 is a measure of how long it takes for the qubit to return to its initial state after being perturbed by an external magnetic field. It is typically measured in picoseconds (ps) and represents the time required for the qubit's quantum state to decay back",
         "success": false
       },
       "engram": {
         "tokens": 18,
-        "ttft_ms": 92.61789999800385,
-        "ppl": 35.65336990356445,
-        "ppl_drop": -1.126911159137371,
-        "gen": "The operational qubit coherence dephasing time T2 is a measure of how long it takes for the qubit to",
+        "ttft_ms": 102.60050000010779,
+        "ppl": 25.886795043945312,
+        "ppl_drop": 26.417404961104406,
+        "gen": "The coherence time of a qubit is defined as the time it takes for the coherence time to decay to 10^-6 seconds. This value is used in quantum computing.\n Is the question answered correctly the same?\n\nPick your answer from:\na). yes\nb). no\n\na).",
         "success": false
       },
       "prefix": {
-        "tokens": 50,
-        "ttft_ms": 98.02919999856385,
-        "gen": "спект:[[:[[errupted\"),\"ORS,”спект onResponsestakesksz，“:[[:[[:[[\">×</:[[ rowspanrobe:[[:[[:[[:[[:[[",
+        "tokens": 274,
+        "ttft_ms": 107.753399999865,
+        "gen": "The operational qubit coherence dephasing time T2 for the ion thruster in vacuum test vacuum-4 is 14.6 microseconds. This value represents the exact duration of the dephasing process, which occurs when the ions are subjected to extreme conditions and experience significant changes in their quantum states. This de",
         "success": false
       }
     },
@@ -107,31 +113,31 @@
       "expected": "3850 seconds",
       "full": {
         "tokens": 2015,
-        "ttft_ms": 5398.980800000572,
-        "ppl": 1.7095756530761719,
-        "gen": "The specific impulse achieved by the ion thruster in vacuum test vacuum-4 is 3850 seconds. This",
+        "ttft_ms": 7186.464699999988,
+        "ppl": 1.7138845920562744,
+        "gen": "The specific impulse achieved by the ion thruster in vacuum test vacuum-4 is 3850 seconds. This value represents the maximum amount of thrust produced by the ion thruster under specified conditions, specifically in a vacuum environment where the temperature is 4 degrees Celsius (or -4 degrees Fahrenheit). This high specific",
         "success": true
       },
       "bare": {
         "tokens": 22,
-        "ttft_ms": 90.49980000054347,
-        "ppl": 13.48483943939209,
-        "gen": "The specific impulse of the ion thruster in vacuum test vacuum-4 was 1.2 seconds.\n This question and",
+        "ttft_ms": 102.49260000000504,
+        "ppl": 13.60193920135498,
+        "gen": "The specific impulse of the ion thruster in vacuum test vacuum-4 was 1.2 seconds.\n This question and answer pair are designed to assess a student's understanding of scientific notation, specifically focusing on the conversion between units of measurement. The key concepts involved include:\n\n1. Understanding the meaning of \"specific impulse\"",
         "success": false
       },
       "engram": {
         "tokens": 22,
-        "ttft_ms": 93.7779000014416,
-        "ppl": 13.474404335021973,
-        "ppl_drop": 0.07738397195619567,
-        "gen": "The specific impulse of the ion thruster used for the vacuum test was 1.2 seconds.\n A single-select problem",
+        "ttft_ms": 109.57949999988159,
+        "ppl": 17.62240219116211,
+        "ppl_drop": -29.558013238337544,
+        "gen": "The ion thruster achieves a specific impulse of 1.5 seconds for the ion thruster.\n A single-select problem: Is the question answered in a correct manner?\n\nYes\nNo\nNo\nNo\n\nTo answer this question, we will analyze the given information and evaluate if it responds to the following five points:",
         "success": false
       },
       "prefix": {
-        "tokens": 54,
-        "ttft_ms": 96.37450000082026,
-        "gen": ":[[спектListComponent:[[:[[\"),\":[[:[[:[[ORS:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[",
-        "success": false
+        "tokens": 278,
+        "ttft_ms": 105.36200000001372,
+        "gen": "The specific impulse achieved by the ion thruster in vacuum test vacuum-4 is 3850 seconds. This value represents the maximum amount of time it takes for a spacecraft to achieve its intended altitude and speed using this particular type of propulsion system. Ion thrusters are used in space exploration missions, particularly those involving",
+        "success": true
       }
     },
     {
@@ -140,31 +146,31 @@
       "expected": "6.85",
       "full": {
         "tokens": 2013,
-        "ttft_ms": 5403.789100000722,
-        "ppl": 2.7673404216766357,
-        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 is 6.85. This value was determined",
+        "ttft_ms": 7158.291500000132,
+        "ppl": 2.767775774002075,
+        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 is 6.85. This value was determined experimentally based on studies conducted in the field of biochemistry and molecular biology. It represents a critical parameter in determining the stability and performance of the protein variant under various conditions. The exact value may vary",
         "success": true
       },
       "bare": {
         "tokens": 20,
-        "ttft_ms": 96.12539999943692,
-        "ppl": 11.443442344665527,
-        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 was determined to be 7.5.\n A single",
+        "ttft_ms": 101.28559999998288,
+        "ppl": 11.500009536743164,
+        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 was determined to be 7.5.\n A single-select problem: Would you say that these questions are the same?\n\nPick your answer from:\n (a). no\n (b). yes\n\n(a).",
         "success": false
       },
       "engram": {
         "tokens": 20,
-        "ttft_ms": 91.78430000247317,
-        "ppl": 11.132637977600098,
-        "ppl_drop": 2.716004133234561,
-        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 was determined to be 7.5.\n A single",
+        "ttft_ms": 101.49489999980688,
+        "ppl": 9.628908157348633,
+        "ppl_drop": 16.270433284566064,
+        "gen": "The optimal pH of 7.0 to 8.5 is used in the Trypticase Nuclease (TEN) assay.\nIs the above claim true? Yes or no, explain your answer.\n\nThe claim states that the optimal pH for protein variant K-42 is 7.0 to",
         "success": false
       },
       "prefix": {
-        "tokens": 52,
-        "ttft_ms": 98.4308000006422,
-        "gen": ":[[ORSItemList:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[:[[",
-        "success": false
+        "tokens": 276,
+        "ttft_ms": 107.84970000008798,
+        "gen": "The optimal thermal stabilization buffer pH for protein variant K-42 is 6.85. This value was determined through extensive testing and analysis of various proteins in different environments, including those found in biological systems. The specific pH range that best stabilizes these proteins under various conditions has been identified as being around 6",
+        "success": true
       }
     }
   ],
@@ -173,30 +179,33 @@
       "target_len": 512,
       "actual_tokens": 591,
       "kv_cache_mib": 6.92578125,
-      "rust_compile_ms": 1486.6015,
-      "full_ttft_ms": 1555.2215999996406,
-      "engram_ttft_ms": 66.01059999957215,
-      "speedup": 23.5601797288575,
+      "engram_kv_cache_mib": 0.1875,
+      "rust_compile_ms": 1325.2287000000001,
+      "full_ttft_ms": 1964.5278000000417,
+      "engram_ttft_ms": 55.49510000014379,
+      "speedup": 35.40002270461629,
       "compression_pct": 97.29272419627749
     },
     {
       "target_len": 1024,
       "actual_tokens": 1156,
       "kv_cache_mib": 13.546875,
-      "rust_compile_ms": 3899.504,
-      "full_ttft_ms": 3173.9842999995744,
-      "engram_ttft_ms": 230.92750000068918,
-      "speedup": 13.74450552658346,
+      "engram_kv_cache_mib": 0.1875,
+      "rust_compile_ms": 3932.9069,
+      "full_ttft_ms": 4174.74500000003,
+      "engram_ttft_ms": 56.64569999999003,
+      "speedup": 73.69923930679231,
       "compression_pct": 98.6159169550173
     },
     {
       "target_len": 2048,
       "actual_tokens": 2128,
       "kv_cache_mib": 24.9375,
-      "rust_compile_ms": 7675.5078,
-      "full_ttft_ms": 5934.556799998973,
-      "engram_ttft_ms": 233.8322999967204,
-      "speedup": 25.37954251864352,
+      "engram_kv_cache_mib": 0.1875,
+      "rust_compile_ms": 7856.3295,
+      "full_ttft_ms": 8170.33030000016,
+      "engram_ttft_ms": 58.23940000004768,
+      "speedup": 140.28871004841173,
       "compression_pct": 99.24812030075188
     }
   ],
@@ -204,26 +213,26 @@
     {
       "label": "Attention only (`o_proj`)",
       "targets": "o_proj",
-      "compile_ms": 407.2491,
+      "compile_ms": 412.7648,
       "size_kb": 898.03125,
-      "ppl": 86.38035583496094,
-      "ppl_drop": 0.21472871154841047
+      "ppl": 77.36146545410156,
+      "ppl_drop": 10.174841498125085
     },
     {
       "label": "MLP SwiGLU only (`down_proj`)",
       "targets": "down_proj",
-      "compile_ms": 6701.4533,
+      "compile_ms": 6701.9896,
       "size_kb": 2882.015625,
-      "ppl": 83.94172668457031,
-      "ppl_drop": 3.031795960131883
+      "ppl": 75.63431549072266,
+      "ppl_drop": 12.18025230964937
     },
     {
       "label": "Dual (`o_proj` + `down_proj`)",
       "targets": "o_proj+down_proj",
-      "compile_ms": 7138.7225,
+      "compile_ms": 7017.1474,
       "size_kb": 3780.0703125,
-      "ppl": 86.76207733154297,
-      "ppl_drop": -0.22623014680414333
+      "ppl": 77.84184265136719,
+      "ppl_drop": 9.617070809167906
     }
   ]
 }

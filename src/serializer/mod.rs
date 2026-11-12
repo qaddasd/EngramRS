@@ -4,7 +4,10 @@ pub mod safetensors;
 use std::path::Path;
 
 pub use peft_config::{module_sub_path, target_module_short_name, write_peft_config};
-pub use safetensors::{f16_bytes, f32_bytes, write_safetensors, write_safetensors_typed};
+pub use safetensors::{
+    bf16_bytes, f16_bytes, f32_bytes, write_safetensors, write_safetensors_dtype,
+    write_safetensors_typed, WeightDtype,
+};
 
 use crate::types::CompiledLayer;
 
@@ -38,9 +41,9 @@ pub fn write_adapter_typed(
 }
 
 fn validate_layers(layers: &[CompiledLayer], base_model_name_or_path: &str) -> Result<(), String> {
-    let Some(first) = layers.first() else {
+    if layers.is_empty() {
         return Err("cannot write an adapter with zero layers".to_string());
-    };
+    }
     if base_model_name_or_path.trim().is_empty() {
         return Err("base_model_name_or_path must not be empty".to_string());
     }
@@ -48,12 +51,8 @@ fn validate_layers(layers: &[CompiledLayer], base_model_name_or_path: &str) -> R
         if layer.rank == 0 || layer.d_in == 0 || layer.d_out == 0 {
             return Err("compiled layers must have positive rank, d_in, and d_out".to_string());
         }
-        if layer.d_out != first.d_out {
-            return Err(format!(
-                "layer {index} d_model ({}) differs from layer 0 ({}); a consistent model dimension is required",
-                layer.d_out, first.d_out
-            ));
-        }
+        // Mixed target shapes are allowed: one adapter can contain q/k/v/o
+        // projections and gate/up/down with different d_in/d_out per target.
         let a_len = layer.rank.checked_mul(layer.d_in).ok_or_else(|| {
             format!("layer {index} lora_A dimensions overflow addressable memory")
         })?;

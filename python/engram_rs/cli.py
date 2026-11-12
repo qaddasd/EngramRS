@@ -190,10 +190,13 @@ def cmd_compare_rag(args: argparse.Namespace) -> int:
     q_counts = [int(x.strip()) for x in args.queries.split(",") if x.strip()]
     params = BenchmarkParams(
         context_tokens=args.context_len,
+        rag_retrieved_tokens=args.rag_topk,
+        resident_prefix_tokens=args.resident_prefix,
         query_tokens=args.query_len,
         answer_tokens=args.answer_len,
         input_price_per_m=args.input_price,
         output_price_per_m=args.output_price,
+        engram_compile_ms=args.compile_ms,
     )
 
     results = compare_rag_vs_engram(
@@ -335,12 +338,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_niah.set_defaults(func=cmd_benchmark_niah)
 
     # 5. compare-rag
-    p_rag = subparsers.add_parser("compare-rag", help="Compute cost and latency comparison vs traditional RAG.")
-    p_rag.add_argument("--context-len", type=int, default=10_000, help="Context length in tokens (default 10,000).")
+    p_rag = subparsers.add_parser("compare-rag", help="Analytical cost/latency/memory model vs traditional top-k RAG.")
+    p_rag.add_argument("--context-len", type=int, default=10_000, help="Full corpus length in tokens, compiled once (default 10,000).")
+    p_rag.add_argument("--rag-topk", type=int, default=2_000, help="Retrieved top-k window RAG resends per query (default 2,000).")
+    p_rag.add_argument("--resident-prefix", type=int, default=256, help="Residual-KV prefix tokens for verbatim facts; 0 = style-only tier (default 256).")
     p_rag.add_argument("--query-len", type=int, default=50, help="Query length in tokens (default 50).")
     p_rag.add_argument("--answer-len", type=int, default=150, help="Answer length in tokens (default 150).")
     p_rag.add_argument("--input-price", type=float, default=2.50, help="Price per 1M input tokens ($).")
     p_rag.add_argument("--output-price", type=float, default=10.00, help="Price per 1M output tokens ($).")
+    p_rag.add_argument("--compile-ms", type=float, default=1600.0, help="One-time compile latency assumption in ms (hardware/model dependent; default 1600).")
     p_rag.add_argument("--queries", default="1,5,10,50,100,500,1000,5000,10000", help="Comma-separated query counts.")
     p_rag.add_argument("-o", "--output", default=None, help="Optional output JSON path.")
     p_rag.set_defaults(func=cmd_compare_rag)

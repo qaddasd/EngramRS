@@ -193,12 +193,6 @@ class EngramContextCatcher:
                 layer = self._layers[index]
                 if "o_proj" in self.targets:
                     catcher = self._attention_catchers[index]
-                    if catcher.input_layernorm is not None:
-                        self._handles.append(
-                            catcher.input_layernorm.register_forward_hook(
-                                self._make_input_layernorm_hook(index, catcher)
-                            )
-                        )
                     self._handles.append(
                         catcher.o_proj.register_forward_hook(
                             self._make_o_proj_hook(index, catcher)
@@ -227,24 +221,6 @@ class EngramContextCatcher:
         self.remove_hooks()
         return False
 
-    def _make_input_layernorm_hook(self, layer_index: int, catcher: AttentionCatcher) -> Any:
-        def hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
-            del module, inputs
-            if layer_index in self._inputs["o_proj"]:
-                raise RuntimeError(
-                    f"decoder layer {layer_index} produced input_layernorm activations more than once; "
-                    "EngramContextCatcher captures exactly one pass"
-                )
-            in_res = capture_tensor(output, layer_index, "input_layernorm", return_sink=True)
-            if isinstance(in_res, tuple):
-                in_arr, in_sink = in_res
-                catcher.sink_input = in_sink
-            else:
-                in_arr = in_res
-            self._inputs["o_proj"][layer_index] = in_arr
-
-        return hook
-
     def _make_o_proj_hook(self, layer_index: int, catcher: AttentionCatcher) -> Any:
         def hook(module: nn.Module, inputs: tuple[Any, ...], output: Any) -> None:
             del module
@@ -253,15 +229,19 @@ class EngramContextCatcher:
                     f"decoder layer {layer_index} produced self_attn.o_proj activations more than once; "
                     "EngramContextCatcher captures exactly one pass"
                 )
-            if layer_index not in self._inputs["o_proj"] and inputs:
-                in_res = capture_tensor(inputs[0], layer_index, "o_proj_input", return_sink=True)
-                if isinstance(in_res, tuple):
-                    in_arr, in_sink = in_res
-                    if catcher.sink_input is None:
-                        catcher.sink_input = in_sink
-                else:
-                    in_arr = in_res
-                self._inputs["o_proj"][layer_index] = in_arr
+            if not inputs:
+                raise RuntimeError(
+                    f"decoder layer {layer_index} self_attn.o_proj received an empty inputs tuple"
+                )
+            # Basis contract: X must be the true runtime input of o_proj
+            # (post-attention multi-head concat), never the pre-attention layernorm.
+            in_res = capture_tensor(inputs[0], layer_index, "o_proj_input", return_sink=True)
+            if isinstance(in_res, tuple):
+                in_arr, in_sink = in_res
+                catcher.sink_input = in_sink
+            else:
+                in_arr = in_res
+            self._inputs["o_proj"][layer_index] = in_arr
 
             out_res = capture_tensor(output, layer_index, "o_proj_output", return_sink=True)
             if isinstance(out_res, tuple):
@@ -328,7 +308,7 @@ class EngramContextCatcher:
             details = []
             if canonical == "o_proj":
                 if missing_in:
-                    details.append(f"missing input_layernorm captures for layers {missing_in}")
+                    details.append(f"missing self_attn.o_proj input captures for layers {missing_in}")
                 if missing_out:
                     details.append(f"missing self_attn.o_proj captures for layers {missing_out}")
             else:
@@ -347,11 +327,6 @@ class EngramContextCatcher:
                 raise RuntimeError(
                     f"decoder layer {index} {canonical} token count mismatch: "
                     f"input {in_shape}, output {out_shape}"
-                )
-            if canonical == "o_proj" and in_shape != out_shape:
-                raise RuntimeError(
-                    f"decoder layer {index} capture shape mismatch: hidden states "
-                    f"{in_shape}, attention outputs {out_shape}"
                 )
         return inputs, outputs
 
@@ -436,6 +411,10 @@ class EngramContextCatcher:
             self._inputs[t].clear()
             self._outputs[t].clear()
         self._cpu_tensors.clear()
+        for attn_catcher in self._attention_catchers.values():
+            attn_catcher.clear()
+        for mlp_catcher in self._mlp_catchers.values():
+            mlp_catcher.clear()
 
     def clear(self) -> None:
         self.remove_hooks()

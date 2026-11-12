@@ -155,7 +155,7 @@ def test_close_and_clear_remove_hooks_and_release_captures():
     tokens = torch.zeros(1, 2, 4)
     catcher = EngramContextCatcher(model, [0])
     with catcher:
-        assert len(model.model.layers[0].input_layernorm._forward_hooks) == 1
+        assert len(model.model.layers[0].input_layernorm._forward_hooks) == 0
         assert len(model.model.layers[0].self_attn.o_proj._forward_hooks) == 1
         model(tokens)
         catcher.get_activations()
@@ -166,7 +166,7 @@ def test_close_and_clear_remove_hooks_and_release_captures():
         catcher.get_activations()
 
     with catcher:
-        assert len(model.model.layers[0].input_layernorm._forward_hooks) == 1
+        assert len(model.model.layers[0].input_layernorm._forward_hooks) == 0
         catcher.clear()
         assert len(model.model.layers[0].input_layernorm._forward_hooks) == 0
         assert len(model.model.layers[0].self_attn.o_proj._forward_hooks) == 0
@@ -200,7 +200,7 @@ def test_missing_modules_and_missing_captures_have_clear_errors():
 
     with EngramContextCatcher(model, [0]) as catcher:
         model.model.layers[0].input_layernorm(torch.zeros(1, 2, 4))
-    with pytest.raises(RuntimeError, match="missing self_attn.o_proj"):
+    with pytest.raises(RuntimeError, match="no activations"):
         catcher.get_activations()
 
 
@@ -340,7 +340,7 @@ def test_target_selection_o_proj_only():
         assert catcher.targets == ("o_proj",)
         layer = model.model.layers[0]
         assert len(layer.mlp.down_proj._forward_hooks) == 0
-        assert len(layer.input_layernorm._forward_hooks) == 1
+        assert len(layer.input_layernorm._forward_hooks) == 0
         assert len(layer.self_attn.o_proj._forward_hooks) == 1
 
         model(tokens)
@@ -360,4 +360,58 @@ def test_invalid_targets_and_missing_mlp_error():
 
     with pytest.raises(AttributeError, match="mlp.down_proj"):
         EngramContextCatcher(model, targets=("down_proj",))
+
+
+class DistinctBasisLayer(nn.Module):
+    """o_proj input differs from input_layernorm output (as in real attention)."""
+
+    def __init__(self, d_model: int) -> None:
+        super().__init__()
+        self.input_layernorm = nn.Linear(d_model, d_model, bias=False)
+        self.self_attn = SimpleNamespace(
+            o_proj=TupleProjection(d_model, d_model, bias=False)
+        )
+        with torch.no_grad():
+            self.input_layernorm.weight.copy_(torch.eye(d_model) * 2.0)
+            self.self_attn.o_proj.weight.copy_(torch.eye(d_model))
+        self.last_o_proj_input: torch.Tensor | None = None
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        normalized = self.input_layernorm(hidden)
+        # Simulate attention mixing: o_proj sees a different basis than layernorm.
+        attn_concat = normalized * 5.0 + 1.0
+        self.last_o_proj_input = attn_concat.detach()
+        out, _ = self.self_attn.o_proj(attn_concat)
+        return out
+
+
+class DistinctBasisModel(nn.Module):
+    def __init__(self, d_model: int = 4) -> None:
+        super().__init__()
+        self.config = SimpleNamespace(
+            num_attention_heads=2, num_key_value_heads=2, hidden_size=d_model
+        )
+        self.model = SimpleNamespace(layers=nn.ModuleList([DistinctBasisLayer(d_model)]))
+
+    def forward(self, hidden: torch.Tensor) -> torch.Tensor:
+        return self.model.layers[0](hidden)
+
+
+def test_o_proj_capture_uses_true_runtime_input_not_layernorm():
+    """Regression for the basis-mismatch bug: X must be the o_proj input."""
+    model = DistinctBasisModel()
+    tokens = (torch.arange(12, dtype=torch.float32).reshape(1, 3, 4) + 1.0) / 3.0
+
+    with EngramContextCatcher(model, [0]) as catcher:
+        model(tokens)
+        inputs, outputs = catcher.get_activations()
+
+    true_o_proj_input = model.model.layers[0].last_o_proj_input
+    layernorm_out = tokens * 2.0
+    assert not torch.allclose(true_o_proj_input, layernorm_out)
+
+    np.testing.assert_allclose(inputs[0], centered(true_o_proj_input), atol=1e-6)
+    np.testing.assert_allclose(outputs[0], centered(true_o_proj_input), atol=1e-6)
+    # The captured input must NOT equal the layernorm output (the old bug).
+    assert not np.allclose(inputs[0], centered(layernorm_out), atol=1e-3)
 

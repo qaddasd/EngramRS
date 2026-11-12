@@ -18,7 +18,7 @@ import numpy as np
 import torch
 from torch import nn
 
-from .null_space import project_lora_to_null_space, project_to_null_space
+from .null_space import project_to_null_space
 from .randomized_svd import randomized_svd
 
 TensorLike = Union[torch.Tensor, np.ndarray]
@@ -144,16 +144,18 @@ class StreamingCovarianceAccumulator:
     ) -> int:
         """Stream long context through model forward passes and accumulate C and P.
 
-        Processes chunk by chunk with optional rolling context overlap. Intermediate
-        activations are freed after each chunk, keeping memory strictly O(d^2) for
-        arbitrarily long contexts (10k - 100k+ tokens).
+        Uses a single persistent KV cache across chunks so causal attention and RoPE
+        positions are continuous (each token attends to the full preceding context).
+        The accumulator statistics stay O(d^2) per layer; the forward KV cache is O(N)
+        as required for exact causal attention.
 
         Args:
             model: HuggingFace decoder model.
             tokenizer: Model tokenizer.
             text_or_tokens: Raw context text string or token IDs list/tensor.
             chunk_size: Chunk size in tokens (default 2048).
-            overlap_tokens: Preceding tokens to include in forward pass for causal attention context (default 0).
+            overlap_tokens: Unused (kept for API compatibility); continuous cache
+                makes overlap re-feeding unnecessary and harmful.
             device: Model device.
             layer_indices: Optional subset of decoder layers.
 
@@ -187,25 +189,39 @@ class StreamingCovarianceAccumulator:
         was_training = model.training
         model.eval()
 
+        # Causal continuity: a single persistent KV cache spans all chunks so that
+        # every token attends to the full preceding context and RoPE positions are
+        # continuous. Independent per-chunk forwards (the old behavior) destroyed
+        # cross-chunk attention and produced semantically wrong activations.
+        from transformers import DynamicCache
+
+        cache = DynamicCache()
+        # overlap_tokens is accepted for API compatibility but unused: with a
+        # continuous cache, re-feeding overlap would double-count tokens.
+        _ = overlap_tokens
+
         try:
             for start_idx in range(0, total_tokens, chunk_size):
                 end_idx = min(start_idx + chunk_size, total_tokens)
-                window_start = max(0, start_idx - overlap_tokens)
-                overlap_len = start_idx - window_start
-
-                chunk_ids = input_ids[:, window_start:end_idx].to(device)
+                chunk_ids = input_ids[:, start_idx:end_idx].to(device)
+                cache_position = torch.arange(start_idx, end_idx, device=device)
+                attention_mask = torch.ones(1, end_idx, dtype=torch.long, device=device)
 
                 with torch.no_grad(), catcher:
-                    outputs = model(input_ids=chunk_ids, use_cache=False)
+                    outputs = model(
+                        input_ids=chunk_ids,
+                        past_key_values=cache,
+                        attention_mask=attention_mask,
+                        cache_position=cache_position,
+                        use_cache=True,
+                    )
                     del outputs
 
                 hidden_states, attention_outputs = catcher.get_activations()
                 for layer_idx, hidden, attention in zip(
                     catcher.layer_indices, hidden_states, attention_outputs
                 ):
-                    new_hidden = hidden[overlap_len:]
-                    new_attention = attention[overlap_len:]
-                    self.add_chunk(layer_idx, new_hidden, new_attention)
+                    self.add_chunk(layer_idx, hidden, attention)
 
                 catcher.clear()
                 del chunk_ids
@@ -215,6 +231,7 @@ class StreamingCovarianceAccumulator:
             return total_tokens
         finally:
             catcher.clear()
+            del cache
             model.train(was_training)
 
     def solve(
@@ -254,7 +271,11 @@ class StreamingCovarianceAccumulator:
             p_mat = self._p[layer_idx]
             d = self._d_models[layer_idx]
 
-            reg_gram = c_mat + lambda_reg * np.eye(d, dtype=c_mat.dtype)
+            # Relative ridge: lambda scales with the covariance energy so it remains
+            # meaningful across activation magnitudes (absolute 1e-4 is negligible
+            # for LLM activations with ||x||^2 ~ 1e3-1e6).
+            lambda_eff = lambda_reg * float(np.trace(c_mat)) / max(1, d)
+            reg_gram = c_mat + lambda_eff * np.eye(d, dtype=c_mat.dtype)
             try:
                 # Solve (C + lambda I) W = P
                 weights = np.linalg.solve(reg_gram, p_mat).astype(np.float32)
@@ -263,6 +284,9 @@ class StreamingCovarianceAccumulator:
                 weights, _, _, _ = np.linalg.lstsq(reg_gram, p_mat, rcond=None)
                 weights = weights.astype(np.float32)
 
+            # Project once into the null-space of background activations, then
+            # factorize. Projecting again after factorization (the old behavior)
+            # double-attenuated the update.
             if strict_null_projection and null_states is not None and layer_idx in null_states:
                 x_null = null_states[layer_idx]
                 weights = project_to_null_space(weights, x_null, side="right")
@@ -289,10 +313,6 @@ class StreamingCovarianceAccumulator:
             for k in range(effective_rank):
                 lora_a[k, :] = scales[k] * u[:, k]
                 lora_b[:, k] = scales[k] * vh[k, :]
-
-            if strict_null_projection and null_states is not None and layer_idx in null_states:
-                x_null = null_states[layer_idx]
-                lora_a, lora_b = project_lora_to_null_space(lora_a, lora_b, x_null)
 
             compiled_layers[layer_idx] = (lora_a, lora_b)
 

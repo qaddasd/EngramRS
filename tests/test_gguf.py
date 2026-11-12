@@ -62,8 +62,8 @@ def test_gguf_writer_and_reader_roundtrip(tmp_path: Path):
     arr1 = np.arange(12, dtype=np.float32).reshape(3, 4)
     arr2 = np.ones((5, 2), dtype=np.float32) * 3.14
 
-    writer.add_tensor("blk.0.attn_output.weight.lora_a", arr1, raw_dtype=GGMLType.F32)
-    writer.add_tensor("blk.0.attn_output.weight.lora_b", arr2, raw_dtype=GGMLType.F16)
+    writer.add_tensor("blk.0.attn_output.lora_a", arr1, raw_dtype=GGMLType.F32)
+    writer.add_tensor("blk.0.attn_output.lora_b", arr2, raw_dtype=GGMLType.F16)
 
     gguf_path = tmp_path / "test.gguf"
     writer.write_to_file(gguf_path)
@@ -81,20 +81,20 @@ def test_gguf_writer_and_reader_roundtrip(tmp_path: Path):
     assert reader.metadata["general.tags"] == ["memory", "fast", "lora"]
 
     # Verify tensor 1 (F32)
-    t1_info = reader.tensors["blk.0.attn_output.weight.lora_a"]
+    t1_info = reader.tensors["blk.0.attn_output.lora_a"]
     assert t1_info["dtype"] == GGMLType.F32
     # In GGML, dimensions are innermost-first (reversed from NumPy [3, 4] -> [4, 3])
     assert t1_info["shape"] == [4, 3]
     assert t1_info["offset"] % 32 == 0
-    t1_loaded = reader.get_tensor_data("blk.0.attn_output.weight.lora_a")
+    t1_loaded = reader.get_tensor_data("blk.0.attn_output.lora_a")
     assert np.allclose(t1_loaded, arr1)
 
     # Verify tensor 2 (F16)
-    t2_info = reader.tensors["blk.0.attn_output.weight.lora_b"]
+    t2_info = reader.tensors["blk.0.attn_output.lora_b"]
     assert t2_info["dtype"] == GGMLType.F16
     assert t2_info["shape"] == [2, 5]
     assert t2_info["offset"] % 32 == 0
-    t2_loaded = reader.get_tensor_data("blk.0.attn_output.weight.lora_b")
+    t2_loaded = reader.get_tensor_data("blk.0.attn_output.lora_b")
     assert np.allclose(t2_loaded, arr2, atol=1e-2)
 
 
@@ -102,21 +102,21 @@ def test_peft_to_gguf_tensor_name_mapping():
     # Attention layers
     assert (
         peft_to_gguf_tensor_name("base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight")
-        == "blk.0.attn_output.weight.lora_a"
+        == "blk.0.attn_output.lora_a"
     )
     assert (
         peft_to_gguf_tensor_name("base_model.model.model.layers.0.self_attn.o_proj.lora_B.weight")
-        == "blk.0.attn_output.weight.lora_b"
+        == "blk.0.attn_output.lora_b"
     )
     assert (
         peft_to_gguf_tensor_name("base_model.model.model.layers.3.self_attn.q_proj.lora_A.weight")
-        == "blk.3.attn_q.weight.lora_a"
+        == "blk.3.attn_q.lora_a"
     )
 
     # MLP layers
     assert (
         peft_to_gguf_tensor_name("base_model.model.model.layers.5.mlp.down_proj.lora_B.weight")
-        == "blk.5.ffn_down.weight.lora_b"
+        == "blk.5.ffn_down.lora_b"
     )
 
     # Raw names
@@ -158,15 +158,15 @@ def test_export_lora_to_gguf_e2e(tmp_path: Path):
     assert reader.metadata["general.base_model.0.name"] == "tiny-llama-gguf-test"
 
     # Verify tensor names and shapes
-    assert "blk.0.attn_output.weight.lora_a" in reader.tensors
-    assert "blk.0.attn_output.weight.lora_b" in reader.tensors
-    assert "blk.1.attn_output.weight.lora_a" in reader.tensors
-    assert "blk.1.attn_output.weight.lora_b" in reader.tensors
+    assert "blk.0.attn_output.lora_a" in reader.tensors
+    assert "blk.0.attn_output.lora_b" in reader.tensors
+    assert "blk.1.attn_output.lora_a" in reader.tensors
+    assert "blk.1.attn_output.lora_b" in reader.tensors
 
     # Verify numerical match with safetensors
     from safetensors.torch import load_file
 
     st = load_file(str(Path(adapter_dir) / "adapter_model.safetensors"))
     orig_a = st["base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight"].cpu().numpy()
-    gguf_a = reader.get_tensor_data("blk.0.attn_output.weight.lora_a")
+    gguf_a = reader.get_tensor_data("blk.0.attn_output.lora_a")
     assert np.allclose(orig_a, gguf_a, atol=1e-6)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -51,7 +51,7 @@ class EngramCompiler:
         targets: Iterable[str] = ("o_proj", "down_proj"),
         layer_indices: Iterable[int] | None = None,
         all_layers: bool = False,
-        contrastive_delta: bool = True,
+        contrastive_delta: bool = False,
         surprise_weighting: bool = False,
         scale_depth: bool = True,
         energy_threshold: float | None = None,
@@ -145,9 +145,13 @@ class EngramCompiler:
             target_inputs = {target: acts[0] for target, acts in all_activations.items()}
             target_outputs = {target: acts[1] for target, acts in all_activations.items()}
 
-            # Apply surprise weighting if computed
+            # Apply surprise weighting if computed.
+            # Row weight w enters least squares as sqrt(w) on both X and Y,
+            # so the effective weight is w (not w²).
             if token_weights is not None:
-                token_weights_f32 = np.ascontiguousarray(token_weights, dtype=np.float32)
+                token_weights_f32 = np.ascontiguousarray(
+                    np.sqrt(token_weights), dtype=np.float32
+                )
                 for target in target_inputs:
                     target_inputs[target] = [
                         np.ascontiguousarray(mat * token_weights_f32[:, None], dtype=np.float32)
@@ -201,9 +205,10 @@ class EngramCompiler:
                 if len(null_states_list) != len(catcher.layer_indices):
                     null_states_list = None
 
-            depth_scale_val = (
-                (1.0 / np.sqrt(max(1, len(catcher.layer_indices)))) if scale_depth else 1.0
-            )
+            # depth_scale attenuation removed: it shrank ||ΔW|| by 1/sqrt(L) and
+            # caused prior dominance. Amplitude is carried by the fit itself.
+            # scale_depth is accepted for API compatibility but has no effect.
+            depth_scale_val = 1.0
 
             self.last_compile_time_ms = compile_all_layers_to_safetensors(
                 output_dir=destination,

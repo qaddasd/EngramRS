@@ -1,8 +1,13 @@
+//! Sink-token centering kernels.
+//!
+//! These are plain scalar loops intended to auto-vectorize (AVX2 / AVX-512 /
+//! NEON) under the compiler; no explicit SIMD intrinsics are used.
+
 use half::bf16;
 
 /// Subtract sink-token (first token / row 0) and unpack BF16 to F32 on-the-fly.
 ///
-/// Designed to auto-vectorize to AVX2 / AVX-512 / NEON SIMD instructions.
+/// Scalar loops intended to auto-vectorize; no explicit SIMD intrinsics.
 pub fn center_and_unpack_bf16(raw_bf16: &[u16], nrows: usize, d_model: usize, out_f32: &mut [f32]) {
     assert!(raw_bf16.len() >= nrows * d_model);
     assert!(out_f32.len() >= nrows * d_model);
@@ -10,14 +15,18 @@ pub fn center_and_unpack_bf16(raw_bf16: &[u16], nrows: usize, d_model: usize, ou
         return;
     }
 
-    let sink_row = &raw_bf16[0..d_model];
+    // Hoist the sink-row BF16 -> F32 conversion out of the per-row loop:
+    // the sink is identical for every row, so convert it exactly once.
+    let sink_f32: Vec<f32> = raw_bf16[0..d_model]
+        .iter()
+        .map(|&bits| bf16::from_bits(bits).to_f32())
+        .collect();
     for row in 0..nrows {
         let in_offset = row * d_model;
         let out_offset = row * d_model;
         for col in 0..d_model {
             let val = bf16::from_bits(raw_bf16[in_offset + col]).to_f32();
-            let sink = bf16::from_bits(sink_row[col]).to_f32();
-            out_f32[out_offset + col] = val - sink;
+            out_f32[out_offset + col] = val - sink_f32[col];
         }
     }
 }
@@ -42,15 +51,18 @@ pub fn center_and_unpack_bf16_batched(
     for b in 0..batch_size {
         let batch_offset = b * seq_len * d_model;
         let sink_offset = batch_offset;
-        let sink_row = &raw_bf16[sink_offset..sink_offset + d_model];
+        // Convert this batch's sink row once, not once per sequence row.
+        let sink_f32: Vec<f32> = raw_bf16[sink_offset..sink_offset + d_model]
+            .iter()
+            .map(|&bits| bf16::from_bits(bits).to_f32())
+            .collect();
 
         for s in 0..seq_len {
             let in_pos = batch_offset + s * d_model;
             let out_pos = in_pos;
             for col in 0..d_model {
                 let val = bf16::from_bits(raw_bf16[in_pos + col]).to_f32();
-                let sink = bf16::from_bits(sink_row[col]).to_f32();
-                out_f32[out_pos + col] = val - sink;
+                out_f32[out_pos + col] = val - sink_f32[col];
             }
         }
     }
@@ -137,5 +149,25 @@ mod tests {
         assert_eq!(out[1], 0.0);
         assert_eq!(out[2], 5.0);
         assert_eq!(out[3], 5.0);
+    }
+
+    /// R9: hoisting the per-batch sink conversion must not change behavior.
+    #[test]
+    fn test_center_and_unpack_bf16_batched_subtracts_per_batch_sink() {
+        let raw: Vec<u16> = vec![
+            // batch 0: sink [1, 2], row [3, 5]
+            bf16::from_f32(1.0).to_bits(),
+            bf16::from_f32(2.0).to_bits(),
+            bf16::from_f32(3.0).to_bits(),
+            bf16::from_f32(5.0).to_bits(),
+            // batch 1: sink [10, 20], row [30, 50]
+            bf16::from_f32(10.0).to_bits(),
+            bf16::from_f32(20.0).to_bits(),
+            bf16::from_f32(30.0).to_bits(),
+            bf16::from_f32(50.0).to_bits(),
+        ];
+        let mut out = vec![0.0f32; 8];
+        center_and_unpack_bf16_batched(&raw, 2, 2, 2, &mut out);
+        assert_eq!(out, vec![0.0, 0.0, 2.0, 3.0, 0.0, 0.0, 20.0, 30.0]);
     }
 }

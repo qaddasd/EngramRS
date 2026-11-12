@@ -7,7 +7,7 @@ use faer::Mat;
 use rayon::prelude::*;
 
 use crate::deduplication::deduplicate_rows;
-pub use anchors::{randomized_svd_anchors, svd_anchors};
+pub use anchors::{randomized_svd_anchors, randomized_svd_anchors_seeded, svd_anchors};
 pub use factorize::{factorize_reduced_weights, factorize_weights, select_rank_by_energy};
 pub use mlp_solver::compile_mlp_down_proj;
 pub use solvers::{factorize_dual_via_svd, solve_dual_and_factorize, solve_primal_and_factorize};

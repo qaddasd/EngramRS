@@ -1,31 +1,54 @@
-"""RAG vs Engram Cost and Latency Comparison Utility.
+"""Analytical RAG-vs-Engram cost / latency / memory model.
 
-Computes and displays exact mathematical cost and Time-To-First-Token (TTFT) curves
-comparing:
-  1. Traditional In-Context RAG: Resending context (e.g. 10k tokens) with every query.
-  2. EngramRS Memory Compilation: One-time zero-copy weight compilation + empty-prompt queries.
+This is a *closed-form cost model*, not a measured benchmark. Every number is
+derived from the explicit assumptions in `BenchmarkParams` (token prices,
+prefill/decode throughput, model geometry). It exists to reason about breakeven
+and asymptotic behaviour, not to claim a measured speedup.
 
-Includes pricing metrics ($/1M tokens), TTFT latency (prefill throughput),
-KV cache memory footprint (bytes per concurrent session), and breakeven query calculations.
+Three serving regimes are modelled honestly:
+
+  * Traditional RAG (top-k retrieval). Each query resends only the *retrieved*
+    window (`rag_retrieved_tokens`), NOT the whole corpus. Modelling RAG as
+    resending the entire corpus every query is a strawman; real retrievers
+    return a small top-k window. Systems with prefix caching (vLLM / SGLang)
+    can further amortise a *stable* retrieved prefix across queries — this
+    model does not credit that, so it is an upper bound on RAG cost.
+
+  * Engram soft/style tier (`resident_prefix_tokens = 0`). Context is distilled
+    into LoRA weights and queries carry no resident context. This tier transfers
+    style / domain priors but CANNOT reproduce verbatim facts: a rank-r weight
+    delta cannot store arbitrary token strings (information-theoretic limit).
+
+  * Engram fact tier (`resident_prefix_tokens > 0`, the default). Verbatim recall
+    requires the residual-KV tier: a compressed, RoPE-correct KV prefix of
+    `resident_prefix_tokens` is replayed each query. This is the regime that
+    actually achieves needle recall, so its cost / latency is the default.
+
+`engram_compile_ms` is a one-time, hardware/model-dependent compilation latency
+(an assumption, not a universal constant). For reference, compiling
+Qwen2.5-0.5B (o_proj + down_proj) measured ~1.6 s on a GTX 1650 in release
+builds; debug builds are 100x+ slower. Set it to your own measurement.
 """
 
 from __future__ import annotations
 
-import json
+import math
 from dataclasses import asdict, dataclass
 from typing import Any
 
 
 @dataclass
 class BenchmarkParams:
-    context_tokens: int = 10_000
+    context_tokens: int = 10_000          # full corpus, compiled once
+    rag_retrieved_tokens: int = 2_000     # top-k window RAG resends per query
+    resident_prefix_tokens: int = 256     # residual-KV prefix for verbatim facts (0 => soft/style tier)
     query_tokens: int = 50
     answer_tokens: int = 150
-    input_price_per_m: float = 2.50       # $2.50 per 1M input tokens
-    output_price_per_m: float = 10.00     # $10.00 per 1M output tokens
-    prefill_tok_per_sec: float = 4000.0   # GPU prefill throughput
-    decode_tok_per_sec: float = 60.0      # GPU decode throughput
-    engram_compile_ms: float = 45.0       # Rust zero-copy compilation time
+    input_price_per_m: float = 2.50       # $/1M input tokens (assumption)
+    output_price_per_m: float = 10.00     # $/1M output tokens (assumption)
+    prefill_tok_per_sec: float = 4000.0   # GPU prefill throughput (assumption)
+    decode_tok_per_sec: float = 60.0      # GPU decode throughput (assumption)
+    engram_compile_ms: float = 1600.0     # one-time compile latency (assumption; hardware/model dependent)
     model_layers: int = 32
     kv_heads: int = 8
     head_dim: int = 128
@@ -44,7 +67,7 @@ def compare_rag_vs_engram(
     query_counts: list[int] | None = None,
     params: BenchmarkParams | None = None,
 ) -> dict[str, Any]:
-    """Calculate comprehensive cost, latency, and memory metrics for RAG vs Engram."""
+    """Calculate cost, latency and memory metrics for RAG vs Engram (analytical)."""
     if params is None:
         params = BenchmarkParams(context_tokens=context_tokens)
     else:
@@ -53,46 +76,50 @@ def compare_rag_vs_engram(
     if query_counts is None:
         query_counts = [1, 5, 10, 50, 100, 500, 1000, 5000, 10_000]
 
+    # A retriever cannot return more than the corpus contains; the resident
+    # prefix is a compression of the corpus, so it cannot exceed it either.
+    rag_retrieved = min(params.rag_retrieved_tokens, params.context_tokens)
+    resident_prefix = min(params.resident_prefix_tokens, params.context_tokens)
+
     # --- Cost Analysis ---
-    # In RAG, every query sends: (context_tokens + query_tokens) input + answer_tokens output
-    rag_input_tokens_per_query = params.context_tokens + params.query_tokens
+    # RAG resends the retrieved top-k window + query every time.
+    rag_input_tokens_per_query = rag_retrieved + params.query_tokens
     rag_cost_per_query = (
         (rag_input_tokens_per_query * params.input_price_per_m / 1_000_000.0)
         + (params.answer_tokens * params.output_price_per_m / 1_000_000.0)
     )
 
-    # In Engram, compilation is a one-time prefill of context_tokens
+    # Engram compiles the full corpus once (one-time prefill cost).
     engram_compilation_cost = params.context_tokens * params.input_price_per_m / 1_000_000.0
 
-    # Each subsequent Engram query sends ONLY query_tokens (empty context prompt!)
-    engram_input_tokens_per_query = params.query_tokens
+    # Each Engram query replays the resident prefix (fact tier) + query.
+    # resident_prefix == 0 models the soft/style tier (no verbatim recall).
+    engram_input_tokens_per_query = resident_prefix + params.query_tokens
     engram_cost_per_query = (
         (engram_input_tokens_per_query * params.input_price_per_m / 1_000_000.0)
         + (params.answer_tokens * params.output_price_per_m / 1_000_000.0)
     )
 
-    # Breakeven point: Q where RAG total cost >= Engram total cost
-    # Q * rag_cost = engram_compile_cost + Q * engram_cost
-    # Q * (rag_cost - engram_cost) = engram_compile_cost
-    # Q = engram_compile_cost / (rag_cost - engram_cost)
+    # Breakeven: Q * rag_cost = compile_cost + Q * engram_cost
     cost_delta_per_query = rag_cost_per_query - engram_cost_per_query
     breakeven_queries = (
         (engram_compilation_cost / cost_delta_per_query)
         if cost_delta_per_query > 0
-        else 1.0
+        else math.inf
     )
 
-    # --- Latency Analysis (TTFT: Time To First Token) ---
+    # --- Latency Analysis (TTFT) ---
     rag_ttft_ms = (rag_input_tokens_per_query / params.prefill_tok_per_sec) * 1000.0
     engram_ttft_ms = (engram_input_tokens_per_query / params.prefill_tok_per_sec) * 1000.0
     ttft_speedup = (rag_ttft_ms / engram_ttft_ms) if engram_ttft_ms > 0 else 1.0
 
-    # Total generation time per query
     decode_time_ms = (params.answer_tokens / params.decode_tok_per_sec) * 1000.0
     rag_total_query_lat_ms = rag_ttft_ms + decode_time_ms
     engram_total_query_lat_ms = engram_ttft_ms + decode_time_ms
+    # Compilation is a one-time setup cost paid before the first query.
+    engram_first_query_lat_ms = params.engram_compile_ms + engram_total_query_lat_ms
 
-    # --- Memory Analysis (KV Cache footprint) ---
+    # --- Memory Analysis (KV cache footprint per session) ---
     rag_kv_bytes = compute_kv_cache_bytes(
         params.model_layers, params.kv_heads, params.head_dim, rag_input_tokens_per_query
     )
@@ -101,7 +128,6 @@ def compare_rag_vs_engram(
     )
     kv_reduction_factor = rag_kv_bytes / engram_kv_bytes if engram_kv_bytes > 0 else 1.0
 
-    # Step-by-step curve points
     curve_data = []
     for q in query_counts:
         rag_tot_cost = q * rag_cost_per_query
@@ -119,9 +145,24 @@ def compare_rag_vs_engram(
             "cost_savings_percent": round(savings_pct, 2),
         })
 
+    regime = "fact (residual-KV prefix)" if resident_prefix > 0 else "soft/style (weights only, no verbatim recall)"
+
     return {
+        "model_kind": "analytical cost model (assumptions, not measurements)",
+        "regime": regime,
         "parameters": asdict(params),
-        "breakeven_queries": round(breakeven_queries, 2),
+        "effective_tokens": {
+            "rag_retrieved_tokens": rag_retrieved,
+            "resident_prefix_tokens": resident_prefix,
+            "rag_input_tokens_per_query": rag_input_tokens_per_query,
+            "engram_input_tokens_per_query": engram_input_tokens_per_query,
+        },
+        "breakeven_queries": (round(breakeven_queries, 2) if math.isfinite(breakeven_queries) else None),
+        "one_time_compilation": {
+            "cost_usd": round(engram_compilation_cost, 6),
+            "latency_ms": round(params.engram_compile_ms, 2),
+            "engram_first_query_latency_ms": round(engram_first_query_lat_ms, 2),
+        },
         "per_query_comparison": {
             "rag_cost_usd": round(rag_cost_per_query, 6),
             "engram_cost_usd": round(engram_cost_per_query, 6),
@@ -141,23 +182,38 @@ def compare_rag_vs_engram(
 
 
 def format_rag_comparison_table(results: dict[str, Any]) -> str:
-    """Format RAG vs Engram benchmark into an ASCII comparison table."""
+    """Format the analytical RAG-vs-Engram model into an ASCII table."""
     params = results["parameters"]
+    eff = results["effective_tokens"]
     pq = results["per_query_comparison"]
     mem = results["memory_comparison"]
+    one = results["one_time_compilation"]
     curves = results["query_cost_curves"]
+
+    breakeven = results["breakeven_queries"]
+    if breakeven is None:
+        breakeven_str = "never (Engram per-query cost >= RAG)"
+    else:
+        first_cheaper = max(1, math.floor(breakeven) + 1)
+        breakeven_str = f"{breakeven} queries (Engram cheaper from query {first_cheaper} onward)"
 
     lines = [
         "=" * 84,
-        f"ENGRAM-RS VS TRADITIONAL RAG: SCIENTIFIC BENCHMARK & COST ANALYSIS".center(84),
-        f"(Context: {params['context_tokens']:,} tokens | Query: {params['query_tokens']} tokens | Answer: {params['answer_tokens']} tokens)".center(84),
+        "ENGRAM-RS VS TRADITIONAL RAG: ANALYTICAL COST MODEL".center(84),
+        f"(Corpus: {params['context_tokens']:,}t | RAG top-k: {eff['rag_retrieved_tokens']:,}t | "
+        f"Resident prefix: {eff['resident_prefix_tokens']:,}t)".center(84),
+        f"Regime: {results['regime']}".center(84),
         "=" * 84,
         "",
-        "--- METRIC COMPARISON SUMMARY ---",
-        f"  • TTFT (Time-To-First-Token):  RAG = {pq['rag_ttft_ms']} ms  vs  Engram = {pq['engram_ttft_ms']} ms  ({pq['ttft_speedup_x']}x FASTER)",
-        f"  • KV Cache Memory / Session:   RAG = {mem['rag_kv_cache_mb']} MB  vs  Engram = {mem['engram_kv_cache_mb']} MB  ({mem['kv_cache_reduction_x']}x SAVINGS)",
-        f"  • Cost Per Query:              RAG = ${pq['rag_cost_usd']:.5f}  vs  Engram = ${pq['engram_cost_usd']:.5f}",
-        f"  • Breakeven Point:             {results['breakeven_queries']} queries (Engram is cheaper from query 2 onward)",
+        "--- PER-QUERY METRICS (steady state, after one-time compilation) ---",
+        f"  TTFT:            RAG = {pq['rag_ttft_ms']} ms  vs  Engram = {pq['engram_ttft_ms']} ms  ({pq['ttft_speedup_x']}x)",
+        f"  KV / session:    RAG = {mem['rag_kv_cache_mb']} MB  vs  Engram = {mem['engram_kv_cache_mb']} MB  ({mem['kv_cache_reduction_x']}x)",
+        f"  Cost / query:    RAG = ${pq['rag_cost_usd']:.5f}  vs  Engram = ${pq['engram_cost_usd']:.5f}",
+        f"  Breakeven:       {breakeven_str}",
+        "",
+        "--- ONE-TIME COMPILATION (paid once, before first query) ---",
+        f"  Cost: ${one['cost_usd']:.5f}   Latency: {one['latency_ms']} ms   "
+        f"First-query end-to-end: {one['engram_first_query_latency_ms']} ms",
         "",
         "--- CUMULATIVE COST CURVE ($ USD) ---",
         f"{'Queries':>10} | {'Traditional RAG':>18} | {'EngramRS':>18} | {'Cost Savings':>16} | {'Savings %':>11}",
@@ -172,5 +228,11 @@ def format_rag_comparison_table(results: dict[str, Any]) -> str:
         pct_str = f"{pt['cost_savings_percent']:.1f}%"
         lines.append(f"{q_str:>10} | {rag_str:>18} | {engram_str:>18} | {saved_str:>16} | {pct_str:>11}")
 
-    lines.append("=" * 84)
+    lines += [
+        "=" * 84,
+        "Assumptions, not measurements. RAG resends only its top-k window (prefix",
+        "caching would lower RAG cost further). Verbatim fact recall requires the",
+        "residual-KV prefix; resident_prefix_tokens=0 models the style-only tier.",
+        "=" * 84,
+    ]
     return "\n".join(lines)

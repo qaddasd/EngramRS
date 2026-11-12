@@ -12,7 +12,8 @@ use crate::types::AnchoredMatrices;
 struct DuplicateGroup {
     count: usize,
     x: Vec<f32>,
-    y_sum: Vec<f32>,
+    // Accumulated in f64 to avoid f32 cancellation when summing many rows.
+    y_sum: Vec<f64>,
 }
 
 /// Deduplicate activation rows using 64-bit Locality-Sensitive Hashing (SimHash)
@@ -92,12 +93,12 @@ pub fn deduplicate_rows_lsh(
                 group.x[col] = (group.x[col] * (n - 1.0) + x.read(row, col)) / n;
             }
             for col in 0..d_out {
-                group.y_sum[col] += y.read(row, col);
+                group.y_sum[col] += f64::from(y.read(row, col));
             }
         } else {
             let new_group_idx = entries.len();
             let x_vals: Vec<f32> = (0..d_in).map(|col| x.read(row, col)).collect();
-            let y_vals: Vec<f32> = (0..d_out).map(|col| y.read(row, col)).collect();
+            let y_vals: Vec<f64> = (0..d_out).map(|col| f64::from(y.read(row, col))).collect();
 
             entries.push(DuplicateGroup {
                 count: 1,
@@ -116,7 +117,7 @@ pub fn deduplicate_rows_lsh(
         }),
         y: Mat::from_fn(entries.len(), d_out, |row, col| {
             let group = &entries[row];
-            group.y_sum[col] / (group.count as f32).sqrt()
+            (group.y_sum[col] / (group.count as f64).sqrt()) as f32
         }),
     }
 }
@@ -154,5 +155,41 @@ mod tests {
         let dedup = deduplicate_rows(&x, &y);
         // Row 0 and Row 1 should be merged into 1 group, Row 2 into another -> total 2 rows
         assert_eq!(dedup.x.nrows(), 2);
+    }
+
+    /// R8: y_sum must accumulate in f64 so small contributions are not lost
+    /// when summed alongside large values across many duplicate rows.
+    #[test]
+    fn test_deduplicate_y_sum_accumulates_in_f64() {
+        let d_in = 4;
+        let d_out = 2;
+        let rows = 200;
+        let mut x = Mat::<f32>::zeros(rows, d_in);
+        let mut y = Mat::<f32>::zeros(rows, d_out);
+        for r in 0..rows {
+            for c in 0..d_in {
+                x.write(r, c, 1.0);
+            }
+            y.write(r, 0, 1e7);
+            y.write(r, 1, 1.0);
+        }
+        let dedup = deduplicate_rows(&x, &y);
+        assert_eq!(dedup.x.nrows(), 1);
+
+        // All rows merge: y_sum = [200 * 1e7, 200], scaled by 1/sqrt(200).
+        // f32 accumulation would lose the +1.0 contributions entirely.
+        let scale = (rows as f32).sqrt();
+        let expected_small = rows as f32 / scale;
+        assert!(
+            (dedup.y.read(0, 1) - expected_small).abs() < 0.01,
+            "small y contributions lost: {} vs {expected_small}",
+            dedup.y.read(0, 1)
+        );
+        let expected_large = rows as f32 * 1e7 / scale;
+        assert!(
+            (dedup.y.read(0, 0) - expected_large).abs() / expected_large < 1e-6,
+            "large y sum inaccurate: {} vs {expected_large}",
+            dedup.y.read(0, 0)
+        );
     }
 }

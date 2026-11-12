@@ -324,7 +324,11 @@ def peft_to_gguf_tensor_name(peft_name: str, standard: bool = True) -> str:
         Maps e.g.:
         `base_model.model.model.layers.0.self_attn.o_proj.lora_A.weight`
         to:
-        `blk.0.attn_output.weight.lora_a`
+        `blk.0.attn_output.lora_a`
+
+        Note: llama.cpp LoRA tensors use the module name *without* the `.weight`
+        suffix that base-model tensors carry (canonical `blk.{i}.attn_output.lora_a`,
+        not `blk.{i}.attn_output.weight.lora_a`).
 
     When standard=False:
         Preserves base_model path with lowercase .lora_a / .lora_b suffix.
@@ -342,13 +346,13 @@ def peft_to_gguf_tensor_name(peft_name: str, standard: bool = True) -> str:
     layer_idx = layer_match.group(1) if layer_match else "0"
 
     module_map = {
-        "self_attn.o_proj": "attn_output.weight",
-        "self_attn.q_proj": "attn_q.weight",
-        "self_attn.k_proj": "attn_k.weight",
-        "self_attn.v_proj": "attn_v.weight",
-        "mlp.down_proj": "ffn_down.weight",
-        "mlp.gate_proj": "ffn_gate.weight",
-        "mlp.up_proj": "ffn_up.weight",
+        "self_attn.o_proj": "attn_output",
+        "self_attn.q_proj": "attn_q",
+        "self_attn.k_proj": "attn_k",
+        "self_attn.v_proj": "attn_v",
+        "mlp.down_proj": "ffn_down",
+        "mlp.gate_proj": "ffn_gate",
+        "mlp.up_proj": "ffn_up",
     }
 
     for hf_mod, gguf_mod in module_map.items():

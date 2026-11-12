@@ -9,6 +9,14 @@ from transformers import DynamicCache, LlamaConfig, LlamaForCausalLM
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
 from engram_rs import EngramPrefixTuner, spectral_compress_kv
+from engram_rs.prefix import (
+    _HAS_RUST_ROPE,
+    _rope_rotate_torch,
+    rope_apply_kv,
+    rope_inverse_kv,
+    select_compress_kv,
+    snapkv_importance,
+)
 
 
 class ByteTokenizer:
@@ -266,3 +274,275 @@ def test_softmax_nonlinearity_preservation():
 
     # The output sharply reflects val_match on dim 2, NOT a smoothed average
     assert attn_out[0, 0, 0, 2].item() > 8.0
+
+
+# ---------------------------------------------------------------------------
+# RoPE correctness (fix C6/M6): selection + re-anchoring must match HuggingFace.
+# ---------------------------------------------------------------------------
+
+
+def _hf_rotary(model):
+    from transformers.models.llama.modeling_llama import apply_rotary_pos_emb
+
+    return model.model.rotary_emb, apply_rotary_pos_emb
+
+
+def test_rope_apply_matches_huggingface():
+    """Our forward RoPE must equal HF apply_rotary_pos_emb at arbitrary positions."""
+    model = tiny_llama()
+    rotary, hf_apply = _hf_rotary(model)
+    base = float(model.config.rope_theta)
+    b, h, t, d = 1, 2, 7, model.config.hidden_size // model.config.num_attention_heads
+    k_pre = torch.randn(b, h, t, d)
+    positions = torch.arange(t)
+
+    cos, sin = rotary(k_pre, positions.unsqueeze(0))
+    _, k_hf = hf_apply(k_pre, k_pre, cos, sin)
+    k_mine = rope_apply_kv(k_pre, positions, base=base, partial_rotary_factor=1.0)
+
+    torch.testing.assert_close(k_mine, k_hf, atol=1e-5, rtol=1e-5)
+
+
+def test_rope_inverse_undoes_huggingface():
+    """Our inverse RoPE must recover the pre-RoPE key from HF's post-RoPE key."""
+    model = tiny_llama()
+    rotary, hf_apply = _hf_rotary(model)
+    base = float(model.config.rope_theta)
+    b, h, t, d = 1, 2, 9, model.config.hidden_size // model.config.num_attention_heads
+    k_pre = torch.randn(b, h, t, d)
+    positions = torch.arange(t)
+
+    cos, sin = rotary(k_pre, positions.unsqueeze(0))
+    _, k_hf = hf_apply(k_pre, k_pre, cos, sin)
+    k_back = rope_inverse_kv(k_hf, positions, base=base, partial_rotary_factor=1.0)
+
+    torch.testing.assert_close(k_back, k_pre, atol=1e-5, rtol=1e-5)
+
+
+def test_rope_round_trip_identity_at_shifted_positions():
+    """Invert at p_orig then re-apply at p_new equals a direct HF rotation at p_new."""
+    model = tiny_llama()
+    rotary, hf_apply = _hf_rotary(model)
+    base = float(model.config.rope_theta)
+    b, h, t, d = 1, 2, 5, model.config.hidden_size // model.config.num_attention_heads
+    k_pre = torch.randn(b, h, t, d)
+    p_orig = torch.tensor([3, 11, 40, 7, 99])
+    p_new = torch.arange(t)
+
+    cos_o, sin_o = rotary(k_pre, p_orig.unsqueeze(0))
+    _, k_orig = hf_apply(k_pre, k_pre, cos_o, sin_o)  # HF key at original positions
+
+    k_pre_back = rope_inverse_kv(k_orig, p_orig, base=base)
+    k_new = rope_apply_kv(k_pre_back, p_new, base=base)
+
+    cos_n, sin_n = rotary(k_pre, p_new.unsqueeze(0))
+    _, k_ref = hf_apply(k_pre, k_pre, cos_n, sin_n)  # HF key at new positions
+    torch.testing.assert_close(k_new, k_ref, atol=1e-4, rtol=1e-4)
+
+
+def test_select_compress_kv_keeps_exact_tokens_and_sinks():
+    """Selection must keep exact original rows (no blending) and align K with V."""
+    b, h, t, d = 1, 2, 40, 8
+    p, sinks = 10, 2
+    key = torch.randn(b, h, t, d)
+    value = torch.randn(b, h, t, d)
+
+    k_sel, v_sel, idx = select_compress_kv(
+        key, value, prefix_len=p, preserve_sinks=sinks, return_indices=True
+    )
+    assert k_sel.shape == (b, h, p, d)
+    assert idx.shape == (p,)
+    # Sinks preserved verbatim.
+    assert torch.equal(k_sel[..., :sinks, :], key[..., :sinks, :])
+    assert torch.equal(v_sel[..., :sinks, :], value[..., :sinks, :])
+    # Every selected row is an exact original row, K and V at the same index.
+    for i in range(p):
+        j = int(idx[i])
+        assert torch.equal(k_sel[..., i, :], key[..., j, :])
+        assert torch.equal(v_sel[..., i, :], value[..., j, :])
+
+
+def test_full_retention_prefix_matches_plain_forward():
+    """A prefix keeping all tokens must reproduce a plain full-context forward (C6 plumbing)."""
+    model = tiny_llama()
+    base = float(model.config.rope_theta)
+    context = torch.tensor([[1, 5, 9, 13, 2, 7, 11, 4]])
+    query = torch.tensor([[6, 10, 14]])
+    n = context.shape[1]
+
+    with torch.no_grad():
+        plain = model(torch.cat([context, query], dim=1)).logits[:, n:, :]
+
+    tuner = EngramPrefixTuner(model=model, prefix_len=n, preserve_sinks=1)
+    cache = tuner.capture_kv_cache(input_ids=context)
+    prefix = tuner.compress_kv_cache(cache, prefix_len=n, rope_config=(base, 1.0))
+    inputs = tuner.prepare_generate_inputs(query, prefix)
+    with torch.no_grad():
+        prefixed = model(**inputs).logits
+
+    torch.testing.assert_close(prefixed, plain, atol=1e-4, rtol=1e-4)
+
+
+def test_compressed_prefix_keys_match_hf_repositioning():
+    """The definitive C6 regression: compressed keys equal HF RoPE re-anchored to 0..B-1.
+
+    Builds an independent reference using HF's rotary embedding (inverse via -sin,
+    forward via +sin) and compares it to the tuner's compiled prefix. A RoPE
+    convention mismatch or phase collapse would make these diverge.
+    """
+    model = tiny_llama()
+    rotary, hf_apply = _hf_rotary(model)
+    base = float(model.config.rope_theta)
+    context = torch.tensor([[1, 5, 9, 13, 2, 7, 11, 4, 3, 8, 12, 6]])
+    n = context.shape[1]
+    p = 5
+
+    tuner = EngramPrefixTuner(model=model, prefix_len=p, preserve_sinks=1)
+    cache = tuner.capture_kv_cache(input_ids=context)
+    compiled = tuner.compress_kv_cache(cache, prefix_len=p, rope_config=(base, 1.0))
+
+    k_full, _ = cache[0]  # [B, H, N, D] post-RoPE at original positions
+    b, h, _, d = k_full.shape
+    importance = (k_full * k_full).sum(-1).mean(dim=(0, 1))
+    sinks = 1
+    tail = importance[sinks:]
+    _, top = torch.topk(tail, p - sinks)
+    idx = torch.cat([torch.arange(sinks), torch.sort(top).values + sinks])
+    k_sel_orig = k_full[:, :, idx, :]
+
+    # Independent HF reference: invert at original positions, re-apply at 0..P-1.
+    cos_o, sin_o = rotary(k_sel_orig, idx.unsqueeze(0))
+    _, k_pre = hf_apply(k_sel_orig, k_sel_orig, cos_o, -sin_o)
+    new_pos = torch.arange(p)
+    cos_n, sin_n = rotary(k_pre, new_pos.unsqueeze(0))
+    _, k_ref = hf_apply(k_pre, k_pre, cos_n, sin_n)
+
+    k_compiled, _ = compiled[0]
+    torch.testing.assert_close(k_compiled, k_ref, atol=1e-4, rtol=1e-4)
+
+
+@pytest.mark.skipif(not _HAS_RUST_ROPE, reason="native RoPE extension not built")
+def test_rust_rope_matches_torch_reference():
+    """The Rust core RoPE must agree with the torch reference (CPU float32 path)."""
+    k = torch.randn(1, 2, 7, 8)
+    pos = torch.arange(7)
+    rust_apply = rope_apply_kv(k, pos, base=10000.0)  # routes through Rust on CPU f32
+    ref_apply = _rope_rotate_torch(k, pos, 10000.0, 1.0, inverse=False)
+    torch.testing.assert_close(rust_apply, ref_apply, atol=1e-5, rtol=1e-5)
+
+    rust_inv = rope_inverse_kv(rust_apply, pos, base=10000.0)
+    torch.testing.assert_close(rust_inv, k, atol=1e-5, rtol=1e-5)
+
+
+def _tiny_llama_eager() -> LlamaForCausalLM:
+    config = LlamaConfig(
+        vocab_size=256,
+        hidden_size=16,
+        intermediate_size=32,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        num_key_value_heads=2,
+        max_position_embeddings=128,
+        _name_or_path="tiny-llama-snapkv-test",
+    )
+    config._attn_implementation = "eager"
+    model = LlamaForCausalLM(config)
+    model.eval()
+    return model
+
+
+def test_snapkv_importance_shape_and_nonnegative():
+    model = _tiny_llama_eager()
+    input_ids = torch.tensor([[1, 5, 9, 13, 2, 7, 11, 4, 3, 8, 12, 6]])
+    scores = snapkv_importance(model, input_ids, obs_window=4)
+    assert scores.shape == (model.config.num_hidden_layers, input_ids.shape[1])
+    assert torch.isfinite(scores).all()
+    assert (scores >= 0).all()
+
+
+def test_compress_kv_cache_explicit_scores_select_top_tokens():
+    """With explicit scores, selection must keep the highest-scored exact tokens."""
+    b, h, t, d = 1, 2, 10, 8
+    key = torch.randn(b, h, t, d)
+    value = torch.randn(b, h, t, d)
+    cache = DynamicCache.from_legacy_cache(((key, value),))
+    scores = torch.tensor([0.0, 1, 2, 100, 3, 4, 5, 200, 6, 7])
+
+    tuner = EngramPrefixTuner(prefix_len=3, preserve_sinks=1)
+    compiled = tuner.compress_kv_cache(cache, prefix_len=3, preserve_sinks=1, scores=scores)
+    k_sel, v_sel = compiled[0]
+    expected_idx = torch.tensor([0, 3, 7])  # sink 0 + top-2 tail (7=200, 3=100)
+    torch.testing.assert_close(k_sel, key[:, :, expected_idx, :])
+    torch.testing.assert_close(v_sel, value[:, :, expected_idx, :])
+
+
+def test_compile_prefix_snapkv_produces_valid_cache():
+    model = _tiny_llama_eager()
+    input_ids = torch.tensor([[1, 5, 9, 13, 2, 7, 11, 4, 3, 8, 12, 6]])
+    tuner = EngramPrefixTuner(model=model, prefix_len=5, preserve_sinks=1)
+    prefix = tuner.compile_prefix(input_ids=input_ids, prefix_len=5, selection="snapkv")
+    assert len(prefix) == model.config.num_hidden_layers
+    for layer_idx in range(len(prefix)):
+        k, v = prefix[layer_idx]
+        assert k.shape[-2] == 5
+        assert v.shape[-2] == 5
+        assert torch.isfinite(k).all()
+        assert torch.isfinite(v).all()
+
+
+def test_snapkv_importance_rejects_non_eager():
+    """SDPA/flash models return no attentions; SnapKV must raise, not silently fall back."""
+    config = LlamaConfig(
+        vocab_size=256, hidden_size=16, intermediate_size=32, num_hidden_layers=2,
+        num_attention_heads=2, num_key_value_heads=2, max_position_embeddings=128,
+    )
+    config._attn_implementation = "sdpa"
+    model = LlamaForCausalLM(config).eval()
+    input_ids = torch.tensor([[1, 5, 9, 13, 2, 7]])
+    with pytest.raises(RuntimeError):
+        snapkv_importance(model, input_ids, obs_window=4)
+
+
+def test_snapkv_importance_query_aware_scores_context_only():
+    """Query-aware window scores ONLY context tokens -> shape (L, ctx_len)."""
+    model = _tiny_llama_eager()
+    ctx = torch.tensor([[1, 5, 9, 13, 2, 7, 11, 4, 3, 8, 12, 6]])
+    query = torch.tensor([[4, 9, 2]])
+    scores = snapkv_importance(model, ctx, obs_window=4, query_ids=query)
+    assert scores.shape == (model.config.num_hidden_layers, ctx.shape[1])
+    assert torch.isfinite(scores).all()
+    assert (scores >= 0).all()
+
+
+def test_snapkv_importance_query_aware_differs_from_agnostic():
+    """Using the question as the observation window must change the scores."""
+    model = _tiny_llama_eager()
+    ctx = torch.tensor([[1, 5, 9, 13, 2, 7, 11, 4, 3, 8, 12, 6]])
+    query = torch.tensor([[4, 9, 2]])
+    agnostic = snapkv_importance(model, ctx, obs_window=4)
+    aware = snapkv_importance(model, ctx, obs_window=4, query_ids=query)
+    assert (agnostic - aware).abs().max() > 1e-6
+
+
+def test_snapkv_importance_rejects_empty_query():
+    model = _tiny_llama_eager()
+    ctx = torch.tensor([[1, 5, 9, 13]])
+    with pytest.raises(ValueError):
+        snapkv_importance(model, ctx, query_ids=torch.empty((1, 0), dtype=torch.long))
+
+
+def test_compile_prefix_query_ids_produces_valid_cache():
+    model = _tiny_llama_eager()
+    ctx = torch.tensor([[1, 5, 9, 13, 2, 7, 11, 4, 3, 8, 12, 6]])
+    query = torch.tensor([[4, 9, 2]])
+    tuner = EngramPrefixTuner(model=model, prefix_len=5, preserve_sinks=1)
+    prefix = tuner.compile_prefix(
+        input_ids=ctx, prefix_len=5, selection="snapkv", query_ids=query
+    )
+    assert len(prefix) == model.config.num_hidden_layers
+    for layer_idx in range(len(prefix)):
+        k, v = prefix[layer_idx]
+        assert k.shape[-2] == 5
+        assert v.shape[-2] == 5
+        assert torch.isfinite(k).all()
+        assert torch.isfinite(v).all()

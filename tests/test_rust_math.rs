@@ -2,7 +2,9 @@ use engram_rs::math_core::{
     compile_all_layers, compile_all_targets, compile_layer_weights, compile_target_weights,
     project_layer_null_space, CompiledLayer, LayerCompilerConfig, LayerData, TargetData,
 };
-use engram_rs::serializer::write_adapter;
+use engram_rs::serializer::{
+    f16_bytes, module_sub_path, write_adapter, write_safetensors_dtype, WeightDtype,
+};
 use safetensors::tensor::{Dtype, SafeTensors};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -559,6 +561,9 @@ fn safetensors_fp16_round_trip() {
 
 #[test]
 fn serializer_rejects_inconsistent_layers() {
+    // Mixed d_out across targets is legal now (q/k/v/o + gate/up/down adapters);
+    // genuinely inconsistent layers (lora buffer length != rank * dim) must
+    // still be rejected.
     let layers = vec![
         CompiledLayer {
             lora_a: vec![0.0; 8],
@@ -571,19 +576,19 @@ fn serializer_rejects_inconsistent_layers() {
             d_out: 4,
         },
         CompiledLayer {
-            lora_a: vec![0.0; 3],
-            lora_b: vec![0.0; 3],
-            rank: 1,
-            d_model: 3,
-            target: "o_proj".to_string(),
+            lora_a: vec![0.0; 3], // rank * d_in would be 2 * 4 = 8
+            lora_b: vec![0.0; 8],
+            rank: 2,
+            d_model: 4,
+            target: "q_proj".to_string(),
             layer_index: 1,
-            d_in: 3,
-            d_out: 3,
+            d_in: 4,
+            d_out: 4,
         },
     ];
     let directory = temporary_directory("invalid-adapter");
     let error = write_adapter(&directory, &layers, "test/base-model").unwrap_err();
-    assert!(error.contains("differ"));
+    assert!(error.contains("does not match"));
 }
 
 #[cfg(not(debug_assertions))]
@@ -835,6 +840,542 @@ fn multi_target_spectral_energy_allocation_and_rank_pattern() {
     assert!(names
         .iter()
         .any(|n| n == "base_model.model.model.layers.0.mlp.down_proj.lora_B.weight"));
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Regression tests for the verified bug-fix batch (R1, R2, R4, R5, R6).
+// ---------------------------------------------------------------------------
+
+/// Reconstruct W = A^T B^T (shape [d_in, d_out]) from a compiled LoRA pair.
+fn lora_to_weights(layer: &CompiledLayer) -> Vec<f32> {
+    let mut w = vec![0.0f32; layer.d_in * layer.d_out];
+    for i in 0..layer.d_in {
+        for j in 0..layer.d_out {
+            let mut acc = 0.0f32;
+            for r in 0..layer.rank {
+                acc += layer.lora_a[r * layer.d_in + i] * layer.lora_b[j * layer.rank + r];
+            }
+            w[i * layer.d_out + j] = acc;
+        }
+    }
+    w
+}
+
+fn rect_low_rank_data(
+    n: usize,
+    d_in: usize,
+    d_out: usize,
+    rank: usize,
+    seed: u64,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut rng = Lcg::new(seed);
+    let x: Vec<f32> = (0..n * d_in).map(|_| rng.next_f32()).collect();
+    let a: Vec<f32> = (0..d_in * rank).map(|_| rng.next_f32()).collect();
+    let b: Vec<f32> = (0..d_out * rank).map(|_| rng.next_f32()).collect();
+    let mut y = vec![0.0f32; n * d_out];
+    for row in 0..n {
+        for component in 0..rank {
+            let mut projected = 0.0f32;
+            for inner in 0..d_in {
+                projected += x[row * d_in + inner] * a[inner * rank + component];
+            }
+            for col in 0..d_out {
+                y[row * d_out + col] += projected * b[col * rank + component];
+            }
+        }
+    }
+    (x, y)
+}
+
+/// R1: relative ridge must make the solution invariant to uniform rescaling
+/// of (X, Y), and primal/dual must stay numerically equivalent.
+#[test]
+fn adaptive_ridge_scale_invariance_and_primal_dual_equivalence() {
+    let n = 48;
+    let d = 8;
+    let mut rng = Lcg::new(555);
+    // Ill-conditioned X: column scales 10 .. 0.01 (cond(X^T X) ~ 1e6).
+    let mut x = vec![0.0f32; n * d];
+    for row in 0..n {
+        for col in 0..d {
+            let scale = 10f32.powf(1.0 - 3.0 * col as f32 / (d - 1) as f32);
+            x[row * d + col] = rng.next_f32() * scale;
+        }
+    }
+    let w_true: Vec<f32> = (0..d * d).map(|_| rng.next_f32()).collect();
+    let mut y = vec![0.0f32; n * d];
+    for row in 0..n {
+        for col in 0..d {
+            let mut acc = 0.0f32;
+            for k in 0..d {
+                acc += x[row * d + k] * w_true[k * d + col];
+            }
+            y[row * d + col] = acc + 0.01 * rng.next_f32();
+        }
+    }
+
+    let mut cfg = config(d, n);
+    cfg.lambda_reg = 0.1; // relative epsilon: lambda_eff = 0.1 * trace(gram) / d_in
+    let base = compile_layer_weights(
+        &LayerData {
+            hidden_states: &x,
+            attention_output: &y,
+            null_states: None,
+            d_model: d,
+        },
+        &cfg,
+    )
+    .unwrap();
+    let xs: Vec<f32> = x.iter().map(|v| v * 1000.0).collect();
+    let ys: Vec<f32> = y.iter().map(|v| v * 1000.0).collect();
+    let scaled = compile_layer_weights(
+        &LayerData {
+            hidden_states: &xs,
+            attention_output: &ys,
+            null_states: None,
+            d_model: d,
+        },
+        &cfg,
+    )
+    .unwrap();
+    let w_base = lora_to_weights(&base);
+    let w_scaled = lora_to_weights(&scaled);
+    let sim = cosine(&w_base, &w_scaled);
+    assert!(
+        sim > 0.999,
+        "relative ridge broke scale invariance: cosine={sim}"
+    );
+
+    // Primal vs dual on identical anchored data (n < d_in forces the dual
+    // formulation in production; here both are called explicitly).
+    let n2 = 6;
+    let d2 = 10;
+    let (x2, y2) = rect_low_rank_data(n2, d2, d2, 4, 777);
+    let anchored = engram_rs::math_core::AnchoredMatrices {
+        x: faer::Mat::from_fn(n2, d2, |r, c| x2[r * d2 + c]),
+        y: faer::Mat::from_fn(n2, d2, |r, c| y2[r * d2 + c]),
+    };
+    let mut cfg2 = config(6, n2);
+    cfg2.lambda_reg = 1e-3;
+    let primal =
+        engram_rs::math_core::solve_primal_and_factorize(&anchored, None, 0, &cfg2, "o_proj", 0)
+            .unwrap();
+    let dual =
+        engram_rs::math_core::solve_dual_and_factorize(&anchored, None, 0, &cfg2, "o_proj", 0)
+            .unwrap();
+    let w_primal = lora_to_weights(&primal);
+    let w_dual = lora_to_weights(&dual);
+    let equivalence = cosine(&w_primal, &w_dual);
+    assert!(
+        equivalence > 0.999,
+        "primal/dual equivalence broken: cosine={equivalence}"
+    );
+}
+
+/// R2: dense streaming solve must run Cholesky in f64 and match a direct f64
+/// reference on ill-conditioned data (cond(X^T X) ~ 1e8) far better than f32.
+#[test]
+fn dense_streaming_f64_solve_beats_f32_on_ill_conditioned_data() {
+    use engram_rs::streaming::CovarianceAccumulator;
+    use faer::linalg::solvers::{Cholesky, SpSolver};
+    use faer::{Mat, Side};
+
+    let d_in = 6usize;
+    let d_out = 4usize;
+    let n = 64usize;
+    let mut rng = Lcg::new(2024);
+    let mut x = vec![0.0f32; n * d_in];
+    for row in 0..n {
+        for col in 0..d_in {
+            let scale = 10f32.powf(4.0 * (1.0 - col as f32 / (d_in - 1) as f32));
+            x[row * d_in + col] = rng.next_f32() * scale;
+        }
+    }
+    let w_true: Vec<f32> = (0..d_in * d_out).map(|_| rng.next_f32()).collect();
+    let mut y = vec![0.0f32; n * d_out];
+    for row in 0..n {
+        for col in 0..d_out {
+            let mut acc = 0.0f64;
+            for k in 0..d_in {
+                acc += f64::from(x[row * d_in + k]) * f64::from(w_true[k * d_out + col]);
+            }
+            y[row * d_out + col] = acc as f32;
+        }
+    }
+
+    let lambda = 1e-4f32;
+    let mut acc = CovarianceAccumulator::new(d_in, d_out);
+    let chunk = 16;
+    for c in 0..n / chunk {
+        acc.add_chunk(
+            &x[c * chunk * d_in..(c + 1) * chunk * d_in],
+            &y[c * chunk * d_out..(c + 1) * chunk * d_out],
+            chunk,
+        )
+        .unwrap();
+    }
+    let cfg = LayerCompilerConfig::new(d_out, 256, lambda, 0.0);
+    let layer = acc.solve(&cfg, "o_proj", 0).unwrap();
+    let w_est = lora_to_weights(&layer);
+
+    // Direct f64 reference solve of (X^T X + lambda I) W = X^T Y.
+    let mut gram = vec![0.0f64; d_in * d_in];
+    let mut cross = vec![0.0f64; d_in * d_out];
+    for i in 0..d_in {
+        for j in 0..d_in {
+            let mut s = 0.0f64;
+            for r in 0..n {
+                s += f64::from(x[r * d_in + i]) * f64::from(x[r * d_in + j]);
+            }
+            gram[i * d_in + j] = s;
+        }
+        gram[i * d_in + i] += f64::from(lambda);
+        for j in 0..d_out {
+            let mut s = 0.0f64;
+            for r in 0..n {
+                s += f64::from(x[r * d_in + i]) * f64::from(y[r * d_out + j]);
+            }
+            cross[i * d_out + j] = s;
+        }
+    }
+    let gram_mat = Mat::from_fn(d_in, d_in, |i, j| gram[i * d_in + j]);
+    let cross_mat = Mat::from_fn(d_in, d_out, |i, j| cross[i * d_out + j]);
+    let w_ref = Cholesky::try_new(gram_mat.as_ref(), Side::Lower)
+        .unwrap()
+        .solve(cross_mat.as_ref());
+    let rel_err = |w: &[f32]| -> f64 {
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..d_in {
+            for j in 0..d_out {
+                let reference = w_ref.read(i, j);
+                let diff = f64::from(w[i * d_out + j]) - reference;
+                num += diff * diff;
+                den += reference * reference;
+            }
+        }
+        (num / den).sqrt()
+    };
+    let err_f64 = rel_err(&w_est);
+    assert!(
+        err_f64 < 1e-4,
+        "f64 streaming solve relative error too large: {err_f64}"
+    );
+
+    // Legacy f32 path (cast gram/cross to f32 before Cholesky) for comparison.
+    let gram_f32 = Mat::from_fn(d_in, d_in, |i, j| gram[i * d_in + j] as f32);
+    let cross_f32 = Mat::from_fn(d_in, d_out, |i, j| cross[i * d_out + j] as f32);
+    let err_f32 = match Cholesky::try_new(gram_f32.as_ref(), Side::Lower) {
+        Ok(cholesky) => {
+            let w = cholesky.solve(cross_f32.as_ref());
+            let flat: Vec<f32> = (0..d_in * d_out)
+                .map(|idx| w.read(idx / d_out, idx % d_out))
+                .collect();
+            rel_err(&flat)
+        }
+        Err(_) => f64::INFINITY,
+    };
+    assert!(
+        err_f64 * 10.0 < err_f32,
+        "f64 solve ({err_f64}) must be much better than f32 ({err_f32})"
+    );
+}
+
+/// Build A = U diag(s) V^T with deterministic pseudo-random orthogonal factors.
+fn matrix_with_spectrum(n: usize, d: usize, singular_values: &[f32], seed: u64) -> faer::Mat<f32> {
+    use faer::linalg::solvers::Qr;
+    let mut rng = Lcg::new(seed);
+    let r = singular_values.len().min(n).min(d);
+    let u_rand = faer::Mat::from_fn(n, r, |_, _| rng.next_f32());
+    let v_rand = faer::Mat::from_fn(d, r, |_, _| rng.next_f32());
+    let u = Qr::new(u_rand.as_ref()).compute_thin_q();
+    let v = Qr::new(v_rand.as_ref()).compute_thin_q();
+    faer::Mat::from_fn(n, d, |i, j| {
+        let mut acc = 0.0f32;
+        for (k, &sigma) in singular_values.iter().enumerate().take(r) {
+            acc += u.read(i, k) * sigma * v.read(j, k);
+        }
+        acc
+    })
+}
+
+/// Replica of the OLD no-power, uniform-LCG randomized projection, used to
+/// prove the new power-iteration rSVD strictly improves captured energy.
+fn legacy_no_power_anchor_energy(x: &faer::Mat<f32>, k: usize) -> f64 {
+    use faer::linalg::solvers::Qr;
+    let width = (k + 8).min(x.nrows()).min(x.ncols());
+    let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+    let omega = faer::Mat::from_fn(x.ncols(), width, |_, _| {
+        state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1_442_695_040_888_963_407);
+        let unit = (state >> 40) as f32 / ((1_u64 << 24) - 1) as f32;
+        2.0 * unit - 1.0
+    });
+    let sampled = x.as_ref() * omega.as_ref();
+    let q = Qr::new(sampled.as_ref()).compute_thin_q();
+    let reduced = q.transpose() * x.as_ref();
+    let svd = reduced.as_ref().thin_svd();
+    let s = svd.s_diagonal();
+    (0..k)
+        .map(|i| f64::from(s.read(i)) * f64::from(s.read(i)))
+        .sum()
+}
+
+/// R4: power-iteration rSVD must capture >= 95% of the full-SVD top-k energy
+/// on a slowly-decaying spectrum and beat the old single-pass method.
+#[test]
+fn power_iteration_rsvd_captures_slowly_decaying_spectrum() {
+    let n = 96;
+    let d = 64;
+    let k = 16;
+    let s: Vec<f32> = (1..=d).map(|i| 1.0 / (i as f32).powf(0.3)).collect();
+    let x = matrix_with_spectrum(n, d, &s, 31337);
+    let y = faer::Mat::from_fn(n, 8, |r, c| ((r * 3 + c * 7 + 1) as f32).sin());
+
+    let anchored = engram_rs::math_core::randomized_svd_anchors(&x, &y, k).unwrap();
+    assert_eq!(anchored.x.nrows(), k);
+    let mut captured = 0.0f64;
+    for r in 0..anchored.x.nrows() {
+        for c in 0..anchored.x.ncols() {
+            let v = f64::from(anchored.x.read(r, c));
+            captured += v * v;
+        }
+    }
+    let full_top_k: f64 = s[..k].iter().map(|&v| f64::from(v) * f64::from(v)).sum();
+    assert!(
+        captured >= 0.95 * full_top_k,
+        "power-iteration rSVD captured {captured} of {full_top_k} ({}%)",
+        100.0 * captured / full_top_k
+    );
+    let legacy = legacy_no_power_anchor_energy(&x, k);
+    assert!(
+        captured > legacy,
+        "power iterations must beat the old no-power method: {captured} vs {legacy}"
+    );
+}
+
+/// R4: when k >= rank(A), randomized anchors must preserve the normal
+/// equations (gram and cross) of the original data.
+#[test]
+fn randomized_anchors_preserve_gram_when_k_covers_rank() {
+    let n = 64;
+    let d = 32;
+    let k = 16; // k >= rank = 8, k < min(n, d) so the randomized path is used
+    let s = [10.0f32, 5.0, 3.0, 2.0, 1.0, 0.5, 0.25, 0.125];
+    let x = matrix_with_spectrum(n, d, &s, 4242);
+    let w = faer::Mat::from_fn(d, 12, |r, c| ((r * 5 + c * 3 + 2) as f32).cos() * 0.5);
+    let y = x.as_ref() * w.as_ref();
+
+    let anchored = engram_rs::math_core::randomized_svd_anchors(&x, &y, k).unwrap();
+    let gram_ref = x.transpose() * x.as_ref();
+    let gram_act = anchored.x.transpose() * anchored.x.as_ref();
+    let cross_ref = x.transpose() * y.as_ref();
+    let cross_act = anchored.x.transpose() * anchored.y.as_ref();
+
+    let rel_fro = |a: faer::MatRef<'_, f32>, b: faer::MatRef<'_, f32>| -> f64 {
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for r in 0..a.nrows() {
+            for c in 0..a.ncols() {
+                let diff = f64::from(a.read(r, c)) - f64::from(b.read(r, c));
+                let reference = f64::from(b.read(r, c));
+                num += diff * diff;
+                den += reference * reference;
+            }
+        }
+        (num / den).sqrt()
+    };
+    let gram_err = rel_fro(gram_act.as_ref(), gram_ref.as_ref());
+    let cross_err = rel_fro(cross_act.as_ref(), cross_ref.as_ref());
+    assert!(gram_err < 1e-4, "gram relative error {gram_err}");
+    assert!(cross_err < 1e-4, "cross relative error {cross_err}");
+}
+
+/// R5: one adapter may mix targets with different d_out (o_proj 64,
+/// down_proj 128, q_proj 32); PEFT keys and target_modules must be correct.
+#[test]
+fn mixed_shape_multi_target_adapter_round_trip() {
+    let n = 48;
+    let rank = 4;
+    let (o_x, o_y) = rect_low_rank_data(n, 64, 64, rank, 11);
+    let (dn_x, dn_y) = rect_low_rank_data(n, 256, 128, rank, 22);
+    let (q_x, q_y) = rect_low_rank_data(n, 32, 32, rank, 33);
+    let targets = vec![
+        TargetData {
+            target: "o_proj".to_string(),
+            layer_index: 0,
+            input: &o_x,
+            output: &o_y,
+            null_states: None,
+            d_in: 64,
+            d_out: 64,
+        },
+        TargetData {
+            target: "down_proj".to_string(),
+            layer_index: 0,
+            input: &dn_x,
+            output: &dn_y,
+            null_states: None,
+            d_in: 256,
+            d_out: 128,
+        },
+        TargetData {
+            target: "q_proj".to_string(),
+            layer_index: 0,
+            input: &q_x,
+            output: &q_y,
+            null_states: None,
+            d_in: 32,
+            d_out: 32,
+        },
+    ];
+    let cfg = LayerCompilerConfig::new(rank, n, 1e-4, 0.0);
+    let compiled = compile_all_targets(&targets, &cfg).unwrap();
+    assert_eq!(compiled.len(), 3);
+
+    let directory = temporary_directory("mixed-shape-adapter");
+    write_adapter(&directory, &compiled, "test/mixed-model").unwrap();
+
+    let bytes = std::fs::read(directory.join("adapter_model.safetensors")).unwrap();
+    let tensors = SafeTensors::deserialize(&bytes).unwrap();
+    assert_eq!(tensors.len(), 6);
+    let decode = |data: &[u8]| -> Vec<f32> {
+        data.chunks_exact(4)
+            .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+            .collect()
+    };
+    let expectations = [
+        ("self_attn.o_proj", 64usize, 64usize, &compiled[0]),
+        ("mlp.down_proj", 256, 128, &compiled[1]),
+        ("self_attn.q_proj", 32, 32, &compiled[2]),
+    ];
+    for (sub_path, d_in, d_out, layer) in expectations {
+        let prefix = format!("base_model.model.model.layers.0.{sub_path}.lora_");
+        let a = tensors.tensor(&format!("{prefix}A.weight")).unwrap();
+        let b = tensors.tensor(&format!("{prefix}B.weight")).unwrap();
+        assert_eq!(a.dtype(), Dtype::F32);
+        assert_eq!(a.shape(), &[rank, d_in]);
+        assert_eq!(b.shape(), &[d_out, rank]);
+        assert_eq!(decode(a.data()), layer.lora_a);
+        assert_eq!(decode(b.data()), layer.lora_b);
+    }
+
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("adapter_config.json")).unwrap())
+            .unwrap();
+    let target_modules = config["target_modules"].as_array().unwrap();
+    for name in ["o_proj", "down_proj", "q_proj"] {
+        assert!(
+            target_modules.iter().any(|v| v == name),
+            "target_modules missing {name}: {target_modules:?}"
+        );
+    }
+    assert_eq!(config["r"], serde_json::json!(rank));
+
+    // Remaining attention / MLP module mappings.
+    assert_eq!(module_sub_path("k_proj"), "self_attn.k_proj");
+    assert_eq!(module_sub_path("v_proj"), "self_attn.v_proj");
+    assert_eq!(module_sub_path("gate_proj"), "mlp.gate_proj");
+    assert_eq!(module_sub_path("up_proj"), "mlp.up_proj");
+    assert_eq!(module_sub_path("o_proj"), "self_attn.o_proj");
+    assert_eq!(module_sub_path("down_proj"), "mlp.down_proj");
+
+    std::fs::remove_dir_all(directory).unwrap();
+}
+
+/// R6: f16 conversion must reject out-of-range values instead of writing inf.
+#[test]
+fn f16_overflow_returns_error() {
+    let err = f16_bytes(&[1.0, 70000.0]).unwrap_err();
+    assert!(
+        err.contains("70000"),
+        "error must name the offending value: {err}"
+    );
+    assert!(f16_bytes(&[f32::INFINITY]).is_err());
+    assert!(f16_bytes(&[f32::NAN]).is_err());
+    assert!(f16_bytes(&[65504.0, -65504.0, 0.0]).is_ok());
+
+    let layers = vec![CompiledLayer {
+        lora_a: vec![100000.0, 1.0, 2.0, 3.0],
+        lora_b: vec![0.0; 4],
+        rank: 2,
+        d_model: 2,
+        target: "o_proj".to_string(),
+        layer_index: 0,
+        d_in: 2,
+        d_out: 2,
+    }];
+    let directory = temporary_directory("f16-overflow");
+    let err =
+        engram_rs::serializer::write_safetensors_typed(&directory, &layers, true).unwrap_err();
+    assert!(
+        err.contains("100000"),
+        "writer must propagate the overflow: {err}"
+    );
+    if directory.exists() {
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
+/// R6: BF16 output round-trips within bf16 precision (8 significand bits).
+#[test]
+fn bf16_round_trip_preserves_values() {
+    let lora_a = vec![
+        0.5f32,
+        -1.25,
+        std::f32::consts::PI,
+        100.0,
+        0.001,
+        -0.0,
+        1234.5,
+        -7.75,
+    ];
+    let lora_b = vec![2.5f32, -0.125, 63.5, 0.0078125];
+    let layers = vec![CompiledLayer {
+        lora_a: lora_a.clone(),
+        lora_b: lora_b.clone(),
+        rank: 2,
+        d_model: 2,
+        target: "o_proj".to_string(),
+        layer_index: 0,
+        d_in: 4,
+        d_out: 2,
+    }];
+    let directory = temporary_directory("bf16-roundtrip");
+    std::fs::create_dir_all(&directory).unwrap();
+    write_safetensors_dtype(&directory, &layers, WeightDtype::BF16).unwrap();
+
+    let bytes = std::fs::read(directory.join("adapter_model.safetensors")).unwrap();
+    let tensors = SafeTensors::deserialize(&bytes).unwrap();
+    let prefix = "base_model.model.model.layers.0.self_attn.o_proj.lora_";
+    let a = tensors.tensor(&format!("{prefix}A.weight")).unwrap();
+    let b = tensors.tensor(&format!("{prefix}B.weight")).unwrap();
+    assert_eq!(a.dtype(), Dtype::BF16);
+    assert_eq!(b.dtype(), Dtype::BF16);
+    assert_eq!(a.shape(), &[2, 4]);
+    assert_eq!(b.shape(), &[2, 2]);
+
+    let decode_bf16 = |data: &[u8]| -> Vec<f32> {
+        data.chunks_exact(2)
+            .map(|chunk| half::bf16::from_le_bytes(chunk.try_into().unwrap()).to_f32())
+            .collect()
+    };
+    // bf16 round-to-nearest relative error is bounded by 2^-8 = 1/256.
+    for (actual, expected) in decode_bf16(a.data()).iter().zip(&lora_a) {
+        assert!(
+            (actual - expected).abs() <= expected.abs() / 256.0 + 1e-9,
+            "bf16 lora_A mismatch: {actual} vs {expected}"
+        );
+    }
+    for (actual, expected) in decode_bf16(b.data()).iter().zip(&lora_b) {
+        assert!(
+            (actual - expected).abs() <= expected.abs() / 256.0 + 1e-9,
+            "bf16 lora_B mismatch: {actual} vs {expected}"
+        );
+    }
 
     std::fs::remove_dir_all(directory).unwrap();
 }

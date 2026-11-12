@@ -27,8 +27,8 @@ pub struct AdapterConfig<'a> {
 
 pub fn module_sub_path(target: &str) -> String {
     match target {
-        "o_proj" => "self_attn.o_proj".to_string(),
-        "down_proj" => "mlp.down_proj".to_string(),
+        "q_proj" | "k_proj" | "v_proj" | "o_proj" => format!("self_attn.{target}"),
+        "gate_proj" | "up_proj" | "down_proj" => format!("mlp.{target}"),
         other => other.to_string(),
     }
 }

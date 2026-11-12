@@ -16,8 +16,8 @@ use std::time::Instant;
 
 use math_core::{compile_all_targets, LayerCompilerConfig, TargetData};
 use numpy::{
-    PyArray2, PyArrayDyn, PyArrayMethods, PyReadonlyArray2, PyReadonlyArrayDyn,
-    PyUntypedArrayMethods,
+    PyArray2, PyArray3, PyArrayDyn, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2,
+    PyReadonlyArray3, PyReadonlyArrayDyn, PyUntypedArrayMethods,
 };
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -481,11 +481,124 @@ fn compile_all_layers_to_safetensors(
     Ok(started.elapsed().as_secs_f64() * 1_000.0)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn rope_py_impl<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray3<'py, f32>,
+    positions: PyReadonlyArray1<'py, i64>,
+    base: f64,
+    partial_rotary_factor: f64,
+    inverse: bool,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    let shape = x.shape();
+    let (n_tokens, n_heads, head_dim) = (shape[0], shape[1], shape[2]);
+    let x_slice = x
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("x must be C-contiguous"))?;
+    let pos_slice = positions
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("positions must be C-contiguous"))?;
+    let rotated = if inverse {
+        rope_gqa::rope_inverse(
+            x_slice,
+            pos_slice,
+            base,
+            partial_rotary_factor,
+            n_tokens,
+            n_heads,
+            head_dim,
+        )
+    } else {
+        rope_gqa::rope_apply(
+            x_slice,
+            pos_slice,
+            base,
+            partial_rotary_factor,
+            n_tokens,
+            n_heads,
+            head_dim,
+        )
+    }
+    .map_err(PyValueError::new_err)?;
+
+    let out = PyArray3::<f32>::zeros_bound(py, [n_tokens, n_heads, head_dim], false);
+    let out_slice = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyValueError::new_err("failed to acquire mutable output slice"))?
+    };
+    out_slice.copy_from_slice(&rotated);
+    Ok(out)
+}
+
+/// Apply NeoX half-split RoPE to `x` of shape [n_tokens, n_heads, head_dim]
+/// with per-token i64 `positions`, theta `base` and `partial_rotary_factor`
+/// in (0, 1].
+#[pyfunction]
+#[pyo3(signature = (x, positions, base=10000.0, partial_rotary_factor=1.0))]
+fn rope_apply_py<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray3<'py, f32>,
+    positions: PyReadonlyArray1<'py, i64>,
+    base: f64,
+    partial_rotary_factor: f64,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    rope_py_impl(py, x, positions, base, partial_rotary_factor, false)
+}
+
+/// Undo RoPE applied by `rope_apply_py` with the same positions/base/factor.
+#[pyfunction]
+#[pyo3(signature = (x, positions, base=10000.0, partial_rotary_factor=1.0))]
+fn rope_inverse_py<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray3<'py, f32>,
+    positions: PyReadonlyArray1<'py, i64>,
+    base: f64,
+    partial_rotary_factor: f64,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    rope_py_impl(py, x, positions, base, partial_rotary_factor, true)
+}
+
+/// Expand KV heads for grouped-query attention:
+/// [n_tokens, n_kv_heads, head_dim] -> [n_tokens, n_kv_heads * n_rep, head_dim].
+/// Query head h maps to KV head h // n_rep (torch-style contiguous groups).
+#[pyfunction]
+fn repeat_kv_heads_py<'py>(
+    py: Python<'py>,
+    x: PyReadonlyArray3<'py, f32>,
+    n_rep: usize,
+) -> PyResult<Bound<'py, PyArray3<f32>>> {
+    if n_rep == 0 {
+        return Err(PyValueError::new_err("n_rep must be greater than zero"));
+    }
+    let shape = x.shape();
+    let (n_tokens, n_kv_heads, head_dim) = (shape[0], shape[1], shape[2]);
+    let n_query_heads = n_kv_heads
+        .checked_mul(n_rep)
+        .ok_or_else(|| PyValueError::new_err("n_kv_heads * n_rep overflows addressable memory"))?;
+    let kv_slice = x
+        .as_slice()
+        .map_err(|_| PyValueError::new_err("x must be C-contiguous"))?;
+    let expanded =
+        rope_gqa::repeat_kv_heads(kv_slice, n_tokens, n_query_heads, n_kv_heads, head_dim)
+            .map_err(PyValueError::new_err)?;
+
+    let out = PyArray3::<f32>::zeros_bound(py, [n_tokens, n_query_heads, head_dim], false);
+    let out_slice = unsafe {
+        out.as_slice_mut()
+            .map_err(|_| PyValueError::new_err("failed to acquire mutable output slice"))?
+    };
+    out_slice.copy_from_slice(&expanded);
+    Ok(out)
+}
+
 #[pymodule]
 fn engram_rs(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_function(wrap_pyfunction!(compile_all_layers_to_safetensors, module)?)?;
     module.add_function(wrap_pyfunction!(center_and_unpack_bf16_py, module)?)?;
     module.add_function(wrap_pyfunction!(center_f32_py, module)?)?;
+    module.add_function(wrap_pyfunction!(rope_apply_py, module)?)?;
+    module.add_function(wrap_pyfunction!(rope_inverse_py, module)?)?;
+    module.add_function(wrap_pyfunction!(repeat_kv_heads_py, module)?)?;
     module.add_class::<PyStreamingAccumulator>()?;
     Ok(())
 }
